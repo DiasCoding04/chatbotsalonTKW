@@ -8,20 +8,8 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
-dist
 dist-ssr
-release
 *.local
-
-# Server-side CONTEXT copy (seeded from public/CONTEXT.md)
-data/*
-!data/.gitkeep
-
-# Local env (contains API keys — never commit)
-.env
-deploy/env/server.env
-.env.local
-.env.production
 .env.*.local
 
 # Editor directories and files

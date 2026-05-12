@@ -1,0 +1,18 @@
+# Đặt file này thành .htaccess ở thư mục gốc domain chatbot.salontukawa.com
+# Yêu cầu Apache/LiteSpeed bật mod_rewrite + mod_proxy (flag [P]).
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteBase /
+
+  # Stream / API: không cache response.
+  <IfModule LiteSpeed>
+    CacheDisable public /
+  </IfModule>
+
+  # Proxy toàn bộ request sang Node (PM2, cổng 8787).
+  RewriteRule ^(.*)$ http://127.0.0.1:8787/$1 [P,L]
+</IfModule>
+
+# Upload CONTEXT lớn (tối đa ~8 MB).
+LimitRequestBody 8388608
