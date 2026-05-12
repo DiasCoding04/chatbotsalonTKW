@@ -1,0 +1,52 @@
+:root {
+  --bg: #faf8f6;
+  --surface: #ffffff;
+  --text: #2c2825;
+  --muted: #6b6560;
+  --border: #e8e3dd;
+  --accent: #8b6914;
+  --accent-soft: #f5ebe0;
+  --user-bubble: #2c2825;
+  --user-text: #faf8f6;
+  --model-bubble: #f0ebe5;
+  --danger: #b42318;
+  --radius: 12px;
+  font-family:
+    'Segoe UI',
+    system-ui,
+    sans-serif;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #141210;
+    --surface: #1c1917;
+    --text: #f5f0eb;
+    --muted: #a39e97;
+    --border: #3d3834;
+    --accent: #d4a574;
+    --accent-soft: #2a2520;
+    --user-bubble: #d4a574;
+    --user-text: #141210;
+    --model-bubble: #262320;
+    --danger: #f97066;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100dvh;
+}
+
+#root {
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}

@@ -1,0 +1,18 @@
+[Unit]
+Description=Salon Chat Gemini (chatbot.salontukawa.com)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=salon-chat
+Group=salon-chat
+WorkingDirectory=/var/www/salon-chat-gemini
+EnvironmentFile=-/var/www/salon-chat-gemini/.env
+ExecStart=/usr/bin/npm run start:prod
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
