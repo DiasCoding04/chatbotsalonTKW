@@ -143,7 +143,7 @@ function turnToParts(turn: ChatTurn): ContentPart[] {
   for (const image of turn.images ?? []) {
     parts.push(imageToInlineData(image))
   }
-  if (!parts.length) parts.push({ text: '(ảnh)' })
+  if (!parts.length) parts.push({ text: '(ảnh/video)' })
   return parts
 }
 

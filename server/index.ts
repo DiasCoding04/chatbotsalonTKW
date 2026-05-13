@@ -4,7 +4,12 @@ import {
   clearSharedContextCacheStore,
   ensureSharedContextCache,
 } from './context-cache-store.ts'
-import { ensureContextFile, readContextDocument, writeContextDocument } from './context-store.ts'
+import {
+  ensureContextFile,
+  readContextDocument,
+  readImageSamplesDocument,
+  writeContextDocument,
+} from './context-store.ts'
 import { getServerGeminiApiKey } from './gemini-api-key.ts'
 import { loadEnvFile } from './load-env.ts'
 import { assertProductionEnv } from './production-guards.ts'
@@ -81,6 +86,15 @@ const server = createServer((req, res) => {
       const doc = await writeContextDocument(body.content)
       clearSharedContextCacheStore()
       sendJson(res, 200, contextApiPayload(doc))
+      return
+    }
+
+    if (req.method === 'GET' && url === '/api/image-samples') {
+      const doc = await readImageSamplesDocument()
+      sendJson(res, 200, {
+        content: doc.content,
+        updatedAt: doc.updatedAt,
+      })
       return
     }
 

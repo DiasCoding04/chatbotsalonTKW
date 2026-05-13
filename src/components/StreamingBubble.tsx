@@ -82,10 +82,12 @@ export const StreamingBubble = forwardRef<StreamingBubbleHandle>(function Stream
     endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
   }, [text])
 
+  const visibleText = text.replace(/\[\[\s*SEND_IMAGE\s*:\s*[a-z0-9_-]+\s*\]\]/gi, '')
+
   return (
     <div className="msg model streaming">
       <div className="role">AI</div>
-      {text}
+      {visibleText}
       <span className="stream-caret" aria-hidden />
       <div ref={endRef} />
     </div>

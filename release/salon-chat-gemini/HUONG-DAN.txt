@@ -1,9 +1,0 @@
-OnePanel / Apache (reverse proxy đã cấu hình → 127.0.0.1:8787)
-
-1. Upload và giải nén toàn bộ thư mục này vào document root site.
-2. SSH vào server, cd vào đúng thư mục vừa giải nén.
-3. Chạy:
-   bash deploy/onepanel/go.sh
-
-Cập nhật sau: upload đè file mới rồi chạy lại bước 3.
-Không chạy npm run build trên server.

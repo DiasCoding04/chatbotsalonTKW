@@ -38,7 +38,31 @@ curl -fsS https://chatbot.salontukawa.com/api/health
 
 ## 4. Cập nhật sau này
 
-Local: `build:prod` → `pack:release` → upload tgz → trên server:
+> Trên server đã có `.env`, `.htaccess`, `data/CONTEXT.md` chạy thật — KHÔNG đè.
+
+### Cách nhanh (khuyến nghị, cPanel/DirectAdmin + PM2)
+
+Local:
+
+```powershell
+npm run build:prod
+npm run pack:update
+```
+
+File upload: `release/salon-chat-gemini-update.tgz` (đã kèm code, ảnh mẫu, CONTEXT.md, IMAGE_SAMPLES.md, deploy/…).
+
+Trên server (Terminal cPanel hoặc SSH), `cd` vào thư mục gốc app (cùng cấp `.env`):
+
+```bash
+tar -xzf salon-chat-gemini-update.tgz --strip-components=1
+bash deploy/onepanel/update.sh
+```
+
+`update.sh` tự `npm ci --omit=dev`, restart PM2/systemd, kiểm tra `/api/health`.
+Gói update đẩy **toàn bộ** nội dung mới, chỉ **không chứa** `.env` và `.htaccess` —
+hai file cấu hình runtime + secret được giữ nguyên trên server.
+
+### Cách cũ (deploy lại từ đầu — sẽ đè .env nếu không cẩn thận)
 
 ```bash
 cd /var/www/salon-chat-gemini

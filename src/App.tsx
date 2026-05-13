@@ -29,9 +29,15 @@ import {
 } from './components/StreamingBubble'
 import { ContextEditor } from './components/ContextEditor'
 import { ModelMessageBubbles } from './components/ModelMessageBubbles'
-import { fetchServerContext } from './lib/context-api'
+import { fetchServerContext, fetchServerImageSamples } from './lib/context-api'
 
-type Msg = ChatTurn & { usage?: UsageInfo; clientId?: string; replyToClientId?: string }
+type Msg = ChatTurn & {
+  usage?: UsageInfo
+  clientId?: string
+  replyToClientId?: string
+  /** Text hiển thị cho UI. Text gốc vẫn giữ nhẹ để gửi lại API ở lượt sau. */
+  displayText?: string
+}
 
 const CUSTOMER_QUIET_MS = 15_000
 const RETRY_BASE_MS = 1_500
@@ -119,6 +125,233 @@ function buildFanpagePrompt(branch: BranchPage): string {
   ].join('\n')
 }
 
+type ImageSampleGroup = {
+  key: string
+  label: string
+  usage: string
+  urls: string[]
+}
+
+const IMAGE_SAMPLE_MARKER_RE = /\[\[\s*SEND_IMAGE\s*:\s*([a-z0-9_-]+)\s*\]\]/gi
+
+const IMAGE_SAMPLE_ALIASES: Record<string, string[]> = {
+  moi_noi_long_vu: ['moi noi long vu', 'hinh moi noi', 'mau moi noi'],
+  noi_toc: ['noi toc', 'mau noi toc', 'toc noi'],
+  noi_long_vu_den_chum_den: ['noi long vu den', 'chum toc den', 'toc noi mau den'],
+  toc_ngan_bob_tem: ['toc ngan', 'bob', 'toc tem', 'mau tem'],
+  mai_thua: ['mai thua'],
+  mai_bay: ['mai bay'],
+  mai_phap: ['mai phap'],
+  mai_ngang: ['mai ngang'],
+  duoi_ngan: ['duoi cup toc ngan', 'duoi thang toc ngan', 'toc ngan ngang vai'],
+  duoi_dai: ['duoi cup toc dai', 'duoi thang toc dai'],
+  uon_cup: ['uon cup'],
+  uon_song_ngan: ['uon song toc ngan', 'uon song ngan'],
+  uon_song_dai: ['uon song toc dai', 'uon song dai'],
+  uon_hippie: ['uon hippie', 'uon hippi', 'uon hippe', 'xu mi'],
+  uon_xoan_tang: ['uon xoan tang', 'xoan tang'],
+  uon_xoan_luoi_dai: ['uon xoan luoi dai', 'xoan luoi toc dai', 'uon loi toc dai'],
+  uon_xoan_luoi_ngan: ['uon xoan luoi ngan', 'xoan luoi toc ngan', 'uon loi toc ngan'],
+  nhuom_phu_bac: ['nhuom phu bac'],
+  phu_bac_mau_tram: ['phu bac mau tram', 'nhuom phu bac mau tram'],
+  toc_bac: ['toc bac', 'mau cho toc bac'],
+  mau_tram: ['mau tram', 'mau toi nhe'],
+  mau_thoi_trang: ['mau thoi trang', 'mau noi', 'mau ca tinh'],
+  mau_balayage: ['balayage'],
+  mau_babylight: ['baby light', 'babylight'],
+  nhuom_sang_khong_tay: ['nhuom sang khong can tay', 'mau sang khong tay', 'nhuom khong tay'],
+}
+
+function normalizeSearchText(text: string): string {
+  return text
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+}
+
+function slugifyImageSampleLabel(label: string): string {
+  const normalized = normalizeSearchText(label)
+  return (
+    normalized
+      .replace(/\b(url|anh|mau|dung|khi|khach|hoi|xem)\b/g, ' ')
+      .replace(/\s+/g, '_')
+      .replace(/^_+|_+$/g, '') || 'image_sample'
+  )
+}
+
+function imageSampleKeyForLabel(label: string): string {
+  const normalized = normalizeSearchText(label)
+  if (normalized.includes('moi noi long vu')) return 'moi_noi_long_vu'
+  if (normalized.includes('noi long vu den') || normalized.includes('chum toc den')) {
+    return 'noi_long_vu_den_chum_den'
+  }
+  if (normalized.includes('noi toc')) return 'noi_toc'
+  if (normalized.includes('duoi') && normalized.includes('ngan')) return 'duoi_ngan'
+  if (normalized.includes('duoi') && normalized.includes('dai')) return 'duoi_dai'
+  if (normalized.includes('uon cup')) return 'uon_cup'
+  if (normalized.includes('uon song') && normalized.includes('ngan')) return 'uon_song_ngan'
+  if (normalized.includes('uon song') && normalized.includes('dai')) return 'uon_song_dai'
+  if (normalized.includes('hippie') || normalized.includes('hippi') || normalized.includes('hippe') || normalized.includes('xu mi')) {
+    return 'uon_hippie'
+  }
+  if (normalized.includes('xoan tang')) return 'uon_xoan_tang'
+  if (normalized.includes('xoan luoi') && normalized.includes('dai')) return 'uon_xoan_luoi_dai'
+  if (normalized.includes('xoan luoi') && normalized.includes('ngan')) return 'uon_xoan_luoi_ngan'
+  if (normalized.includes('toc ngan') || normalized.includes('bob') || normalized.includes('tem')) {
+    return 'toc_ngan_bob_tem'
+  }
+  if (normalized.includes('mai thua')) return 'mai_thua'
+  if (normalized.includes('mai bay')) return 'mai_bay'
+  if (normalized.includes('mai phap')) return 'mai_phap'
+  if (normalized.includes('mai ngang')) return 'mai_ngang'
+  if (normalized.includes('phu bac') && normalized.includes('mau tram')) return 'phu_bac_mau_tram'
+  if (normalized.includes('nhuom phu bac')) return 'nhuom_phu_bac'
+  if (normalized.includes('toc bac')) return 'toc_bac'
+  if (normalized.includes('mau tram')) return 'mau_tram'
+  if (normalized.includes('mau thoi trang')) return 'mau_thoi_trang'
+  if (normalized.includes('balayage')) return 'mau_balayage'
+  if (normalized.includes('baby light') || normalized.includes('babylight')) return 'mau_babylight'
+  if (normalized.includes('sang khong') || normalized.includes('khong can tay')) return 'nhuom_sang_khong_tay'
+  return slugifyImageSampleLabel(label)
+}
+
+function extractImageSampleUrls(text: string): string[] {
+  return Array.from(
+    new Set(
+      text.match(/(?:https?:\/\/[^\s),\]]+|(?:\.?\/)?images\/samples\/[^\s),\]]+)/g) ?? [],
+    ),
+  )
+}
+
+function parseImageSampleGroups(markdown: string): ImageSampleGroup[] {
+  const groups: ImageSampleGroup[] = []
+  const seenKeys = new Set<string>()
+  for (const line of markdown.split(/\r?\n/)) {
+    const match = line.match(/^- URL\s+(.+?)\s+\((.+?)\):\s*(.+)$/)
+    if (!match) continue
+    const [, rawLabel, rawUsage, urlText] = match
+    const urls = extractImageSampleUrls(urlText)
+    if (!urls.length) continue
+    const label = rawLabel.trim().replace(/^ảnh mẫu\s+/i, '')
+    const usage = rawUsage.trim()
+    const baseKey = imageSampleKeyForLabel(label)
+    let key = baseKey
+    let suffix = 2
+    while (seenKeys.has(key)) {
+      key = `${baseKey}_${suffix}`
+      suffix += 1
+    }
+    seenKeys.add(key)
+    groups.push({ key, label, usage, urls })
+  }
+  return groups
+}
+
+function buildImageSampleCatalogPrompt(groups: ImageSampleGroup[]): string {
+  if (!groups.length) return ''
+  return [
+    '--- IMAGE SAMPLE ROUTER (không chứa URL) ---',
+    'App có database URL ảnh mẫu riêng, URL không nằm trong prompt để tiết kiệm chi phí.',
+    'Khi tư vấn dịch vụ/kiểu tóc có nhóm ảnh phù hợp, chủ động thêm marker đúng nhóm ở một dòng riêng: [[SEND_IMAGE:key]].',
+    'Không tự viết URL, không giải thích marker cho khách. App sẽ ẩn marker và thay bằng link ảnh thật.',
+    'Dùng tối đa 1-2 marker/lượt; chọn nhóm sát nhất với nhu cầu khách.',
+    'Khi ngữ cảnh là phủ bạc / tóc bạc / hòa bạc / nuôi bạc, chỉ dùng nhuom_phu_bac, phu_bac_mau_tram hoặc toc_bac; tuyệt đối không dùng mau_tram.',
+    'Các key ảnh mẫu:',
+    ...groups.map((group) => `- ${group.key}: ${group.label} (${group.usage})`),
+  ].join('\n')
+}
+
+function mergeContextWithImageSampleCatalog(
+  contextMd: string,
+  imageSampleGroups: ImageSampleGroup[],
+): string {
+  const context = contextMd.trim()
+  const imageCatalog = buildImageSampleCatalogPrompt(imageSampleGroups)
+  if (!imageCatalog) return context
+  return `${context}\n\n${imageCatalog}`.trim()
+}
+
+function compactLines(text: string): string {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line, index, lines) => line.trim() || (index > 0 && index < lines.length - 1))
+    .join('\n')
+    .trim()
+}
+
+function inferImageSampleKeys(text: string, groups: ImageSampleGroup[]): string[] {
+  const normalized = normalizeSearchText(text)
+  if (!/\b(anh|hinh|mau|tham khao|xem|gui)\b/.test(normalized)) return []
+  const keys: string[] = []
+  for (const group of groups) {
+    const aliases = IMAGE_SAMPLE_ALIASES[group.key] ?? [
+      normalizeSearchText(group.label),
+      normalizeSearchText(group.usage),
+    ]
+    if (aliases.some((alias) => alias && normalized.includes(alias))) {
+      keys.push(group.key)
+    }
+    if (keys.length >= 2) break
+  }
+  return keys
+}
+
+function isSilverCoverageContext(text: string): boolean {
+  const normalized = normalizeSearchText(text)
+  return /\b(phu bac|toc bac|bac trang|nhieu bac|hoa bac|nuoi bac)\b/.test(normalized)
+}
+
+function filterImageSampleKeysForContext(keys: string[], contextText: string): string[] {
+  if (!isSilverCoverageContext(contextText)) return keys
+  return keys.filter((key) => key !== 'mau_tram')
+}
+
+function expandModelImageSampleMarkers(
+  rawText: string,
+  groups: ImageSampleGroup[],
+  triggerText: string,
+): { apiText: string; displayText: string } {
+  const groupsByKey = new Map(groups.map((group) => [group.key, group]))
+  const markerKeys: string[] = []
+  let hadMarker = false
+  const textWithoutMarkers = rawText.replace(IMAGE_SAMPLE_MARKER_RE, (_marker, rawKey: string) => {
+    hadMarker = true
+    const key = rawKey.trim().toLowerCase()
+    if (groupsByKey.has(key) && !markerKeys.includes(key)) markerKeys.push(key)
+    return ''
+  })
+  const autoKeys =
+    markerKeys.length > 0 ? [] : inferImageSampleKeys(`${triggerText}\n${rawText}`, groups)
+  const keys = filterImageSampleKeysForContext(
+    [...markerKeys, ...autoKeys].filter((key, index, arr) => arr.indexOf(key) === index),
+    `${triggerText}\n${rawText}`,
+  )
+  if (!keys.length) {
+    const cleanText = hadMarker ? compactLines(textWithoutMarkers) : rawText
+    return { apiText: cleanText, displayText: cleanText }
+  }
+
+  const baseText = compactLines(textWithoutMarkers)
+  const apiAdditions: string[] = []
+  const displayAdditions: string[] = []
+  for (const key of keys) {
+    const group = groupsByKey.get(key)
+    if (!group) continue
+    apiAdditions.push(`Đã gửi ảnh mẫu: ${group.label}`)
+    displayAdditions.push([`Ảnh mẫu ${group.label}:`, ...group.urls].join('\n'))
+  }
+
+  return {
+    apiText: compactLines([baseText, ...apiAdditions].filter(Boolean).join('\n')),
+    displayText: compactLines([baseText, ...displayAdditions].filter(Boolean).join('\n')),
+  }
+}
+
 function buildSystemPrompt(contextMd: string, branch: BranchPage): string {
   const trimmed = contextMd.trim()
   const fanpagePrompt = buildFanpagePrompt(branch)
@@ -161,9 +394,15 @@ function MessageImages({ images }: { images: ChatImage[] }) {
   if (!images.length) return null
   return (
     <div className="msg-images">
-      {images.map((image, idx) => (
-        <img key={`${image.mimeType}-${idx}`} src={image.dataUrl} alt={`Ảnh ${idx + 1}`} />
-      ))}
+      {images.map((image, idx) =>
+        image.mimeType.startsWith('video/') ? (
+          <video key={`${image.mimeType}-${idx}`} src={image.dataUrl} controls playsInline preload="metadata">
+            Video {idx + 1}
+          </video>
+        ) : (
+          <img key={`${image.mimeType}-${idx}`} src={image.dataUrl} alt={`Ảnh ${idx + 1}`} />
+        ),
+      )}
     </div>
   )
 }
@@ -268,6 +507,7 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
   const maxOutputTokens = Number(import.meta.env.VITE_MAX_OUTPUT_TOKENS) || 256
 
   const [contextMd, setContextMd] = useState('')
+  const [imageSamplesMd, setImageSamplesMd] = useState('')
   const [contextBanner, setContextBanner] = useState<ContextBanner>(null)
   const [contextFromServer, setContextFromServer] = useState(false)
   const [contextRequiresEditToken, setContextRequiresEditToken] = useState(false)
@@ -283,7 +523,7 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
   const [ctxMetrics, setCtxMetrics] = useState<CtxTokenMetrics | null>(null)
   const [lastPerf, setLastPerf] = useState<LastPerf | null>(null)
   const [cacheStatus, setCacheStatus] = useState<CacheStatus>({ kind: 'idle' })
-  const [waitModeEnabled, setWaitModeEnabled] = useState(true)
+  const [waitModeEnabled, setWaitModeEnabled] = useState(false)
   const [selectedBranchId, setSelectedBranchId] = useState(1)
 
   const chatEndRef = useRef<HTMLDivElement>(null)
@@ -320,11 +560,34 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
 
   const loadContext = useCallback(async () => {
     setContextBanner(null)
+    const loadImageSamples = async (): Promise<string> => {
+      try {
+        const serverDoc = await fetchServerImageSamples()
+        if (serverDoc) return serverDoc.content
+      } catch {
+        // Fall back to the static public file below.
+      }
+
+      try {
+        const res = await fetch('/IMAGE_SAMPLES.md', { cache: 'no-store' })
+        if (!res.ok) throw new Error(`${res.status}`)
+        return await res.text()
+      } catch {
+        try {
+          const { default: fallback } = await import('./context/IMAGE_SAMPLES.fallback.md?raw')
+          return fallback
+        } catch {
+          return ''
+        }
+      }
+    }
+
     try {
       const serverDoc = await fetchServerContext()
       if (serverDoc) {
         setContextFromServer(true)
         setContextRequiresEditToken(serverDoc.requiresEditToken)
+        setImageSamplesMd(await loadImageSamples())
         setContextMd(serverDoc.content)
         return
       }
@@ -341,10 +604,12 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
     try {
       const res = await fetch('/CONTEXT.md', { cache: 'no-store' })
       if (!res.ok) throw new Error(`${res.status}`)
+      setImageSamplesMd(await loadImageSamples())
       setContextMd(await res.text())
     } catch {
       try {
         const { default: fallback } = await import('./context/CONTEXT.fallback.md?raw')
+        setImageSamplesMd(await loadImageSamples())
         setContextMd(fallback)
         setContextBanner({
           level: 'warn',
@@ -352,6 +617,7 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
             'Không tải được CONTEXT từ server hoặc public/CONTEXT.md — đang dùng bản nhúng trong mã nguồn.',
         })
       } catch {
+        setImageSamplesMd('')
         setContextMd('')
         setContextBanner({
           level: 'error',
@@ -370,9 +636,17 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
     () => BRANCH_PAGES.find((branch) => branch.id === selectedBranchId) ?? BRANCH_PAGES[0],
     [selectedBranchId],
   )
+  const imageSampleGroups = useMemo(
+    () => parseImageSampleGroups(imageSamplesMd),
+    [imageSamplesMd],
+  )
+  const promptContextMd = useMemo(
+    () => mergeContextWithImageSampleCatalog(contextMd, imageSampleGroups),
+    [contextMd, imageSampleGroups],
+  )
   const systemPrompt = useMemo(
-    () => buildSystemPrompt(contextMd, selectedBranch),
-    [contextMd, selectedBranch],
+    () => buildSystemPrompt(promptContextMd, selectedBranch),
+    [promptContextMd, selectedBranch],
   )
   const contextCacheFingerprint = useMemo(
     () =>
@@ -383,19 +657,19 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
   /** OpenAI: ước token CONTEXT cục bộ (không gọi API đếm). */
   useEffect(() => {
     if (isGemini) return
-    if (!apiKey.trim() || !contextMd.trim()) {
+    if (!apiKey.trim() || !promptContextMd.trim()) {
       setCtxMetrics(null)
       return
     }
       const t = window.setTimeout(() => {
-        const fileText = contextMd.trim()
+        const fileText = promptContextMd.trim()
         setCtxMetrics({
           file: estimateTokensRough(fileText),
-          systemFull: estimateTokensRough(buildSystemPrompt(contextMd, selectedBranch)),
+          systemFull: estimateTokensRough(buildSystemPrompt(promptContextMd, selectedBranch)),
         })
       }, 200)
     return () => window.clearTimeout(t)
-  }, [isGemini, geminiReady, contextMd, apiKey, selectedBranch])
+  }, [isGemini, geminiReady, promptContextMd, apiKey, selectedBranch])
 
   /** Gemini: cache toàn bộ systemPrompt (tiền tố salon + CONTEXT.md) qua Context Cache API. */
   useEffect(() => {
@@ -458,7 +732,7 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
   /** Gemini: đếm token CONTEXT (UI chi phí) — chạy nền, có thể hủy khi user gửi chat. */
   useEffect(() => {
     if (!isGemini) return
-    if (!geminiReady || !contextMd.trim()) {
+    if (!geminiReady || !promptContextMd.trim()) {
       setCtxMetrics(null)
       return
     }
@@ -467,8 +741,8 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
     const ac = new AbortController()
     metricsAbortRef.current = ac
 
-    const fileText = contextMd.trim()
-    const fullSystem = buildSystemPrompt(contextMd, selectedBranch)
+    const fileText = promptContextMd.trim()
+    const fullSystem = buildSystemPrompt(promptContextMd, selectedBranch)
     const METRICS_DELAY_MS = 3000
 
     window.clearTimeout(bgMetricsTimerRef.current)
@@ -491,7 +765,7 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
       window.clearTimeout(bgMetricsTimerRef.current)
       ac.abort()
     }
-  }, [isGemini, apiKey, geminiReady, contextMd, model, systemPrompt, selectedBranch])
+  }, [isGemini, apiKey, geminiReady, promptContextMd, model, systemPrompt, selectedBranch])
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -504,7 +778,7 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
     setAttachError(null)
     const room = MAX_CHAT_IMAGES - pendingImages.length
     if (room <= 0) {
-      setAttachError(`Tối đa ${MAX_CHAT_IMAGES} ảnh mỗi tin.`)
+      setAttachError(`Tối đa ${MAX_CHAT_IMAGES} ảnh/video mỗi tin.`)
       return
     }
     const picked = files.slice(0, room)
@@ -573,7 +847,7 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
     })
   }
 
-  function finalizeBatchedReply(text: string, usage?: UsageInfo) {
+  function finalizeBatchedReply(text: string, usage?: UsageInfo, displayText?: string) {
     commitMessages((prev) => {
       for (let i = prev.length - 1; i >= 0; i--) {
         const msg = prev[i]
@@ -584,11 +858,12 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
             text,
             usage,
             replyToClientId: msg.replyToClientId,
+            displayText,
           }
           return copy
         }
       }
-      return [...prev, { role: 'model', text, usage }]
+      return [...prev, { role: 'model', text, usage, displayText }]
     })
   }
 
@@ -644,7 +919,15 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
 
           const finalText =
             result.text.trim() || streamingRef.current?.getText().trim() || result.text
-          finalizeBatchedReply(finalText, result.usage)
+          const lastCustomerText = [...historyForApi]
+            .reverse()
+            .find((turn) => turn.role === 'user')?.text ?? ''
+          const imageExpanded = expandModelImageSampleMarkers(
+            finalText,
+            imageSampleGroups,
+            lastCustomerText,
+          )
+          finalizeBatchedReply(imageExpanded.apiText, result.usage, imageExpanded.displayText)
 
           if (result.usage) {
             const u = result.usage
@@ -797,14 +1080,46 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
     )
   }
 
+  const displayTitle = title?.trim() || 'Salon — chat AI'
+  const initials =
+    displayTitle
+      .replace(/[—–-]/g, ' ')
+      .split(/\s+/)
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((part) => part[0]?.toUpperCase() ?? '')
+      .join('') || 'AI'
+
+  const headerStatus = missingKey
+    ? { className: 'status-dot warn', label: 'Thiếu API key' }
+    : loading
+      ? { className: 'status-dot', label: 'Đang phản hồi' }
+      : awaitingCustomer
+        ? { className: 'status-dot warn', label: 'Chờ 15 giây' }
+        : { className: 'status-dot', label: 'Sẵn sàng' }
+
   return (
     <div className="app">
       <header className="header">
-        <h1>{title?.trim() || 'Salon — chat AI'}</h1>
-        <p>
-          Provider: <code>{isGemini ? 'gemini' : 'openai'}</code> · model <code>{model}</code>. Ngữ cảnh từ{' '}
-          <code>CONTEXT.md</code>.
-        </p>
+        <div className="header-logo" aria-hidden="true">
+          {initials}
+        </div>
+        <div className="header-body">
+          <h1>{displayTitle}</h1>
+          <p className="header-sub">
+            <span className={headerStatus.className}>{headerStatus.label}</span>
+            <span>
+              Provider <code>{isGemini ? 'gemini' : 'openai'}</code>
+            </span>
+            <span>
+              · model <code>{model}</code>
+            </span>
+            <span>
+              · ngữ cảnh <code>CONTEXT.md</code>
+            </span>
+          </p>
+        </div>
       </header>
 
       {missingKey && (
@@ -944,11 +1259,31 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
 
       <div className="chat" aria-busy={loading}>
         {messages.length === 0 && (
-          <p className="empty">
-            {missingKey
-              ? 'Thêm API key để bắt đầu.'
-              : 'Nhập tin nhắn cho khách salon — chữ sẽ hiện dần (stream).'}
-          </p>
+          <div className="empty">
+            <div className="empty-icon" aria-hidden="true">
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 24 24"
+                width="28"
+                height="28"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M21 12a8 8 0 0 1-11.8 7l-4.7 1 1-4.7A8 8 0 1 1 21 12z" />
+              </svg>
+            </div>
+            <p className="empty-title">
+              {missingKey ? 'Cần thêm API key để bắt đầu' : 'Sẵn sàng tư vấn khách salon'}
+            </p>
+            <p className="empty-sub">
+              {missingKey
+                ? 'Dán API key vào file .env rồi khởi động lại Vite.'
+                : 'Nhập tin nhắn hoặc đính kèm ảnh/video — AI trả lời từng câu, có gửi ảnh mẫu nếu phù hợp.'}
+            </p>
+          </div>
         )}
         {messages.flatMap((m, i) => {
           const isErr = m.role === 'model' && m.text.startsWith('[Lỗi API]')
@@ -999,7 +1334,7 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
             <ModelMessageBubbles
               key={`model-${i}`}
               messageKey={`model-${i}`}
-              text={m.text}
+              text={m.displayText ?? m.text}
               usageLine={
                 m.usage ? (
                   <UsageLine
@@ -1019,7 +1354,7 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
         <input
           ref={imageInputRef}
           type="file"
-          accept="image/jpeg,image/png,image/webp,image/gif"
+          accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/webm,video/quicktime"
           multiple
           hidden
           onChange={(e) => void onPickImages(e)}
@@ -1029,12 +1364,29 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
           className="secondary attach"
           disabled={missingKey || pendingImages.length >= MAX_CHAT_IMAGES}
           onClick={() => imageInputRef.current?.click()}
+          aria-label="Đính kèm ảnh hoặc video"
+          title="Đính kèm ảnh hoặc video"
         >
-          Ảnh
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            width="20"
+            height="20"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <rect x="3" y="4" width="18" height="16" rx="2.5" />
+            <circle cx="8.5" cy="10" r="1.5" />
+            <path d="M21 16l-5-5-9 9" />
+          </svg>
         </button>
         <textarea
           rows={2}
-          placeholder="Nhập tin nhắn hoặc đính kèm ảnh (tóc, màu, kiểu mẫu)..."
+          placeholder="Nhập tin nhắn hoặc đính kèm ảnh/video (tóc, màu, kiểu mẫu)…  ⏎ để gửi · Shift+⏎ xuống dòng"
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => {
@@ -1051,23 +1403,46 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
           disabled={missingKey || !canSend}
           onClick={() => send()}
         >
-          {loading ? 'Đang trả lời…' : awaitingCustomer ? 'Chờ 15s…' : 'Gửi'}
+          <span>{loading ? 'Đang trả lời…' : awaitingCustomer ? 'Chờ 15s…' : 'Gửi'}</span>
+          {!loading && !awaitingCustomer && (
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 24 24"
+              width="16"
+              height="16"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M5 12h14" />
+              <path d="m13 6 6 6-6 6" />
+            </svg>
+          )}
         </button>
       </div>
       {waitModeEnabled && awaitingCustomer && !loading && (
-        <p className="context-hint">Khách im 15 giây thì AI đọc toàn bộ tin và trả lời một lần.</p>
+        <p className="composer-hint">Khách im 15 giây thì AI đọc toàn bộ tin và trả lời một lần.</p>
       )}
       {attachError && <p className="attach-error">{attachError}</p>}
       {pendingImages.length > 0 && (
         <div className="pending-images">
           {pendingImages.map((image, idx) => (
             <div key={`pending-${idx}`} className="pending-image">
-              <img src={image.dataUrl} alt={`Ảnh đính kèm ${idx + 1}`} />
+              {image.mimeType.startsWith('video/') ? (
+                <video src={image.dataUrl} controls playsInline preload="metadata">
+                  Video đính kèm {idx + 1}
+                </video>
+              ) : (
+                <img src={image.dataUrl} alt={`Ảnh đính kèm ${idx + 1}`} />
+              )}
               <button
                 type="button"
                 className="secondary pending-image-remove"
                 onClick={() => removePendingImage(idx)}
-                aria-label={`Xóa ảnh ${idx + 1}`}
+                aria-label={`Xóa file ${idx + 1}`}
               >
                 ×
               </button>

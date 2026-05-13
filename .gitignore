@@ -13,6 +13,9 @@ dist-server
 *.local
 .env.*.local
 
+# Release archives — GitHub không cho push file > 100MB, build local rồi upload thẳng.
+release/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

@@ -24,8 +24,97 @@ const SALON_SYSTEM =
   'Bạn là trợ lý ảo của một salon tóc. Trả lời ngắn gọn, lịch sự, tiếng Việt. ' +
   'Giúp khách đặt lịch, tư vấn dịch vụ và giá theo ngữ cảnh được cung cấp bên dưới.'
 
+const IMAGE_SAMPLE_KEY_OVERRIDES = [
+  ['moi noi long vu', 'moi_noi_long_vu'],
+  ['noi long vu den', 'noi_long_vu_den_chum_den'],
+  ['chum toc den', 'noi_long_vu_den_chum_den'],
+  ['noi toc', 'noi_toc'],
+  ['toc ngan', 'toc_ngan_bob_tem'],
+  ['bob', 'toc_ngan_bob_tem'],
+  ['tem', 'toc_ngan_bob_tem'],
+  ['mai thua', 'mai_thua'],
+  ['mai bay', 'mai_bay'],
+  ['mai phap', 'mai_phap'],
+  ['mai ngang', 'mai_ngang'],
+  ['duoi cup duoi thang tu nhien toc ngan', 'duoi_ngan'],
+  ['duoi cup duoi thang tu nhien toc dai', 'duoi_dai'],
+  ['uon cup', 'uon_cup'],
+  ['uon song toc ngan', 'uon_song_ngan'],
+  ['uon song toc dai', 'uon_song_dai'],
+  ['hippie', 'uon_hippie'],
+  ['hippi', 'uon_hippie'],
+  ['hippe', 'uon_hippie'],
+  ['xu mi', 'uon_hippie'],
+  ['xoan tang', 'uon_xoan_tang'],
+  ['xoan luoi toc dai', 'uon_xoan_luoi_dai'],
+  ['xoan luoi toc ngan', 'uon_xoan_luoi_ngan'],
+  ['phu bac mau tram', 'phu_bac_mau_tram'],
+  ['nhuom phu bac', 'nhuom_phu_bac'],
+  ['toc bac', 'toc_bac'],
+  ['mau tram', 'mau_tram'],
+  ['mau thoi trang', 'mau_thoi_trang'],
+  ['balayage', 'mau_balayage'],
+  ['baby light', 'mau_babylight'],
+  ['babylight', 'mau_babylight'],
+  ['sang khong can tay', 'nhuom_sang_khong_tay'],
+]
+
+function normalizeSearchText(text) {
+  return text
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+}
+
+function imageSampleKeyForLabel(label) {
+  const normalized = normalizeSearchText(label)
+  const hit = [...IMAGE_SAMPLE_KEY_OVERRIDES]
+    .sort((a, b) => b[0].length - a[0].length)
+    .find(([needle]) => normalized.includes(needle))
+  if (hit) return hit[1]
+  return normalized.replace(/\b(url|anh|mau|dung|khi|khach|hoi|xem)\b/g, ' ').trim().replace(/\s+/g, '_')
+}
+
+function buildImageSampleCatalogPrompt(markdown) {
+  const groups = []
+  const seen = new Set()
+  for (const line of markdown.split(/\r?\n/)) {
+    const match = line.match(/^- URL\s+(.+?)\s+\((.+?)\):\s*(.+)$/)
+    if (!match) continue
+    const [, rawLabel, rawUsage, urlText] = match
+    if (!/(https?:\/\/|(?:\.?\/)?images\/samples\/)/.test(urlText)) continue
+    const label = rawLabel.trim().replace(/^ảnh mẫu\s+/i, '')
+    const baseKey = imageSampleKeyForLabel(label)
+    let key = baseKey
+    let suffix = 2
+    while (seen.has(key)) {
+      key = `${baseKey}_${suffix}`
+      suffix += 1
+    }
+    seen.add(key)
+    groups.push({ key, label, usage: rawUsage.trim() })
+  }
+  if (!groups.length) return ''
+  return [
+    '--- IMAGE SAMPLE ROUTER (không chứa URL) ---',
+    'App có database URL ảnh mẫu riêng, URL không nằm trong prompt để tiết kiệm chi phí.',
+    'Khi tư vấn dịch vụ/kiểu tóc có nhóm ảnh phù hợp, chủ động thêm marker đúng nhóm ở một dòng riêng: [[SEND_IMAGE:key]].',
+    'Không tự viết URL, không giải thích marker cho khách. App sẽ ẩn marker và thay bằng link ảnh thật.',
+    'Dùng tối đa 1-2 marker/lượt; chọn nhóm sát nhất với nhu cầu khách.',
+    'Các key ảnh mẫu:',
+    ...groups.map((group) => `- ${group.key}: ${group.label} (${group.usage})`),
+  ].join('\n')
+}
+
 const contextMd = readFileSync(resolve(root, 'public/CONTEXT.md'), 'utf8').trim()
-const systemPrompt = `${SALON_SYSTEM}\n\n--- Ngữ cảnh salon (CONTEXT.md) ---\n\n${contextMd}`
+const imageSamplesMd = readFileSync(resolve(root, 'public/IMAGE_SAMPLES.md'), 'utf8').trim()
+const imageSampleCatalog = buildImageSampleCatalogPrompt(imageSamplesMd)
+const promptContextMd = `${contextMd}\n\n${imageSampleCatalog}`.trim()
+const systemPrompt = `${SALON_SYSTEM}\n\n--- Ngữ cảnh salon (CONTEXT.md) ---\n\n${promptContextMd}`
 const fullModel = model.startsWith('models/') ? model : `models/${model}`
 const base = 'https://generativelanguage.googleapis.com/v1beta'
 

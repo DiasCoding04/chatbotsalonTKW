@@ -4,6 +4,11 @@ export type ContextApiDocument = {
   requiresEditToken: boolean
 }
 
+export type ImageSamplesApiDocument = {
+  content: string
+  updatedAt: string
+}
+
 const TOKEN_STORAGE_KEY = 'salon-context-editor-token'
 
 export function readStoredContextEditToken(): string {
@@ -34,6 +39,15 @@ export async function fetchServerContext(): Promise<ContextApiDocument | null> {
     throw new Error(`Không tải được CONTEXT từ server (${res.status}).`)
   }
   return (await res.json()) as ContextApiDocument
+}
+
+export async function fetchServerImageSamples(): Promise<ImageSamplesApiDocument | null> {
+  const res = await fetch('/api/image-samples', { cache: 'no-store' })
+  if (res.status === 404) return null
+  if (!res.ok) {
+    throw new Error(`Không tải được IMAGE_SAMPLES từ server (${res.status}).`)
+  }
+  return (await res.json()) as ImageSamplesApiDocument
 }
 
 export async function saveServerContext(
