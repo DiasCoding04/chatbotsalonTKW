@@ -725,20 +725,21 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
     const tariff = getTariff(model)
     const sys = ctxMetrics
     if (!tariff) return { ok: false as const, reason: 'no-tariff' as const, model }
-    if (!sys || stats.totalPrompt <= 0)
+    if (stats.totalPrompt <= 0)
       return { ok: false as const, reason: 'no-metrics' as const, model }
 
     const bill = estimateUsd(tariff, stats.totalPrompt, stats.totalCached, stats.totalOutput)
     const p = stats.totalPrompt
-    const fileTokLuyKe = sys.file * stats.calls
-    const usdMessages = (stats.totalChatInput / p) * bill.inputUsd
-    const usdContextFile = (fileTokLuyKe / p) * bill.inputUsd
+    const fileTokLuyKe = sys ? sys.file * stats.calls : 0
+    const usdMessages = sys ? (stats.totalChatInput / p) * bill.inputUsd : 0
+    const usdContextFile = sys ? (fileTokLuyKe / p) * bill.inputUsd : 0
     const usdPrefix = Math.max(0, bill.inputUsd - usdMessages - usdContextFile)
 
     return {
       ok: true as const,
       model,
       tariffLabel: tariff.label,
+      hasContextBreakdown: Boolean(sys),
       usdMessages,
       usdContextFile,
       usdPrefix,
@@ -1094,30 +1095,42 @@ export default function App({ forcedProvider, forcedModel, title }: AppProps = {
                 </p>
                 <table className="cost-simple">
                   <tbody>
+                    {sessionCost.hasContextBreakdown ? (
+                      <>
+                        <tr>
+                          <td>
+                            1) Input <strong>tin nhắn</strong> (hội thoại, không gồm nội dung{' '}
+                            <code>CONTEXT.md</code>)
+                          </td>
+                          <CostAmountCells usd={sessionCost.usdMessages} />
+                        </tr>
+                        <tr>
+                          <td>
+                            2) Input <strong>tổng CONTEXT.md</strong> (ước{' '}
+                            <code>
+                              {((ctxMetrics?.file ?? 0) * stats.calls).toLocaleString('vi-VN')}
+                            </code>{' '}
+                            tok file × {stats.calls} lần gọi)
+                          </td>
+                          <CostAmountCells usd={sessionCost.usdContextFile} />
+                        </tr>
+                      </>
+                    ) : (
+                      <tr>
+                        <td>
+                          1) Input <strong>tổng</strong> (Google usage, chưa tách hội thoại /{' '}
+                          <code>CONTEXT.md</code>)
+                        </td>
+                        <CostAmountCells usd={sessionCost.inputUsd} />
+                      </tr>
+                    )}
                     <tr>
-                      <td>
-                        1) Input <strong>tin nhắn</strong> (hội thoại, không gồm nội dung{' '}
-                        <code>CONTEXT.md</code>)
-                      </td>
-                      <CostAmountCells usd={sessionCost.usdMessages} />
-                    </tr>
-                    <tr>
-                      <td>
-                        2) Input <strong>tổng CONTEXT.md</strong> (ước{' '}
-                        <code>
-                          {(ctxMetrics!.file * stats.calls).toLocaleString('vi-VN')}
-                        </code>{' '}
-                        tok file × {stats.calls} lần gọi)
-                      </td>
-                      <CostAmountCells usd={sessionCost.usdContextFile} />
-                    </tr>
-                    <tr>
-                      <td>3) Output (trả lời model)</td>
+                      <td>{sessionCost.hasContextBreakdown ? '3' : '2'}) Output (trả lời model)</td>
                       <CostAmountCells usd={sessionCost.usdOutput} />
                     </tr>
                     <tr className="cost-total">
                       <td>
-                        <strong>4) Tổng cuộc hội thoại (API)</strong>
+                        <strong>{sessionCost.hasContextBreakdown ? '4' : '3'}) Tổng cuộc hội thoại (API)</strong>
                       </td>
                       <CostAmountCells usd={sessionCost.usdTotal} strong />
                     </tr>

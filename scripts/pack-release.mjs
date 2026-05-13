@@ -21,6 +21,7 @@ mkdirSync(outDir, { recursive: true })
 
 const copyPaths = [
   'dist',
+  'dist-server',
   'server',
   'shared',
   'public',

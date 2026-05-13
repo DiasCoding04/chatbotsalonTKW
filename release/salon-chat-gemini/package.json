@@ -5,13 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently -k -n server,web \"npm run server\" \"vite\"",
+    "dev:vertex": "powershell -ExecutionPolicy Bypass -File scripts/run-vertex-local.ps1",
     "server": "tsx server/index.ts",
-    "build": "tsc -b && vite build",
-    "build:prod": "tsc -b && vite build --mode production",
+    "build": "tsc -b && vite build && npm run build:server",
+    "build:server": "tsc -p tsconfig.server.json",
+    "build:prod": "tsc -b && vite build --mode production && npm run build:server",
     "lint": "eslint .",
     "preview": "vite preview",
     "start": "npm run build && tsx server/index.ts",
-    "start:prod": "tsx server/index.ts",
+    "start:prod": "node dist-server/server/index.js",
     "start:server": "tsx server/index.ts",
     "pack:release": "node scripts/pack-release.mjs"
   },

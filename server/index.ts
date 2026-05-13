@@ -12,6 +12,7 @@ import { readJsonBody } from './request-body.ts'
 import { applySecurityHeaders } from './security-headers.ts'
 import { canServeStaticBuild, tryServeStatic } from './static.ts'
 import { tryProxyUpstream } from './upstream-proxy.ts'
+import { useVertexGeminiBackend } from './vertex-auth.ts'
 
 loadEnvFile()
 assertProductionEnv()
@@ -85,7 +86,7 @@ const server = createServer((req, res) => {
 
     if (req.method === 'POST' && url === '/api/context-cache/ensure') {
       const apiKey = getServerGeminiApiKey()
-      if (!apiKey) {
+      if (!useVertexGeminiBackend() && !apiKey) {
         sendJson(res, 500, { error: 'Thiếu GEMINI_API_KEY trên server.' })
         return
       }

@@ -2,9 +2,17 @@ export function assertProductionEnv(): void {
   if (process.env.NODE_ENV !== 'production') return
 
   const missing: string[] = []
-  const geminiKey =
-    process.env.GEMINI_API_KEY?.trim() || process.env.VITE_GEMINI_API_KEY?.trim()
-  if (!geminiKey) missing.push('GEMINI_API_KEY')
+  const useVertex = process.env.GEMINI_BACKEND?.trim().toLowerCase() === 'vertex'
+  if (useVertex) {
+    if (!process.env.VERTEX_AI_PROJECT_ID?.trim()) missing.push('VERTEX_AI_PROJECT_ID')
+    if (!process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim() && !process.env.VERTEX_SERVICE_ACCOUNT_JSON?.trim()) {
+      missing.push('GOOGLE_APPLICATION_CREDENTIALS')
+    }
+  } else {
+    const geminiKey =
+      process.env.GEMINI_API_KEY?.trim() || process.env.VITE_GEMINI_API_KEY?.trim()
+    if (!geminiKey) missing.push('GEMINI_API_KEY')
+  }
   if (!process.env.CONTEXT_EDITOR_TOKEN?.trim()) missing.push('CONTEXT_EDITOR_TOKEN')
 
   if (missing.length) {
