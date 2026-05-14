@@ -3,11 +3,18 @@ import { readFileSync } from 'node:fs'
 
 const TOKEN_URL = 'https://oauth2.googleapis.com/token'
 const SCOPE = 'https://www.googleapis.com/auth/cloud-platform'
+const METADATA_TOKEN_URL =
+  'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token'
 const EARLY_REFRESH_MS = 60_000
 
 type ServiceAccountKey = {
   client_email?: string
   private_key?: string
+}
+
+type MetadataTokenResponse = {
+  access_token?: string
+  expires_in?: number
 }
 
 let cachedToken: { accessToken: string; expiresAt: number } | null = null
@@ -20,14 +27,12 @@ function base64Url(input: string): string {
     .replaceAll('=', '')
 }
 
-function readServiceAccount(): ServiceAccountKey {
+function readServiceAccount(): ServiceAccountKey | null {
   const inline = process.env.VERTEX_SERVICE_ACCOUNT_JSON?.trim()
   if (inline) return JSON.parse(inline) as ServiceAccountKey
 
   const file = process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim()
-  if (!file) {
-    throw new Error('Thiếu GOOGLE_APPLICATION_CREDENTIALS hoặc VERTEX_SERVICE_ACCOUNT_JSON cho Vertex AI.')
-  }
+  if (!file) return null
   return JSON.parse(readFileSync(file, 'utf8')) as ServiceAccountKey
 }
 
@@ -52,6 +57,20 @@ function createJwt(sa: ServiceAccountKey): string {
   return `${unsigned}.${signature.replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '')}`
 }
 
+async function getMetadataAccessToken(): Promise<string> {
+  const res = await fetch(METADATA_TOKEN_URL, {
+    method: 'GET',
+    headers: { 'Metadata-Flavor': 'Google' },
+  })
+  const raw = await res.text()
+  if (!res.ok) throw new Error(raw || `${res.status} ${res.statusText}`)
+
+  const data = JSON.parse(raw) as MetadataTokenResponse
+  if (!data.access_token) throw new Error('Metadata token response thiếu access_token.')
+
+  return data.access_token
+}
+
 export function useVertexGeminiBackend(): boolean {
   return process.env.GEMINI_BACKEND?.trim().toLowerCase() === 'vertex'
 }
@@ -62,24 +81,33 @@ export async function getVertexAccessToken(): Promise<string> {
     return cachedToken.accessToken
   }
 
-  const assertion = createJwt(readServiceAccount())
-  const res = await fetch(TOKEN_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-      assertion,
-    }),
-  })
-  const raw = await res.text()
-  if (!res.ok) throw new Error(raw || `${res.status} ${res.statusText}`)
+  const serviceAccount = readServiceAccount()
+  let token: string
+  let expiresIn = 3600
 
-  const data = JSON.parse(raw) as { access_token?: string; expires_in?: number }
-  if (!data.access_token) throw new Error('OAuth token response thiếu access_token.')
+  if (serviceAccount) {
+    const assertion = createJwt(serviceAccount)
+    const res = await fetch(TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+        assertion,
+      }),
+    })
+    const raw = await res.text()
+    if (!res.ok) throw new Error(raw || `${res.status} ${res.statusText}`)
+    const data = JSON.parse(raw) as { access_token?: string; expires_in?: number }
+    if (!data.access_token) throw new Error('OAuth token response thiếu access_token.')
+    token = data.access_token
+    expiresIn = data.expires_in ?? expiresIn
+  } else {
+    token = await getMetadataAccessToken()
+  }
 
   cachedToken = {
-    accessToken: data.access_token,
-    expiresAt: now + (data.expires_in ?? 3600) * 1000,
+    accessToken: token,
+    expiresAt: now + expiresIn * 1000,
   }
   return cachedToken.accessToken
 }

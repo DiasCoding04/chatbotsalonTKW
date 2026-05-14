@@ -24,6 +24,8 @@ If you use Vertex AI, set these environment variables in production:
   or
 - `VERTEX_SERVICE_ACCOUNT_JSON=<service-account-json>`
 
+If deploying to Cloud Run, you can also rely on the Cloud Run service account and omit the explicit credentials file/JSON, because the app now supports Google Cloud metadata-based credentials.
+
 Also keep:
 - `NODE_ENV=production`
 - `APP_PUBLIC_URL=https://chatbot.salontukawa.com`

@@ -1,3 +1,7 @@
+function isRunningOnGoogleCloud(): boolean {
+  return Boolean(process.env.K_SERVICE || process.env.GAE_SERVICE || process.env.GOOGLE_CLOUD_PROJECT)
+}
+
 export function assertProductionEnv(): void {
   if (process.env.NODE_ENV !== 'production') return
 
@@ -5,7 +9,11 @@ export function assertProductionEnv(): void {
   const useVertex = process.env.GEMINI_BACKEND?.trim().toLowerCase() === 'vertex'
   if (useVertex) {
     if (!process.env.VERTEX_AI_PROJECT_ID?.trim()) missing.push('VERTEX_AI_PROJECT_ID')
-    if (!process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim() && !process.env.VERTEX_SERVICE_ACCOUNT_JSON?.trim()) {
+    if (
+      !process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim() &&
+      !process.env.VERTEX_SERVICE_ACCOUNT_JSON?.trim() &&
+      !isRunningOnGoogleCloud()
+    ) {
       missing.push('GOOGLE_APPLICATION_CREDENTIALS')
     }
   } else {
