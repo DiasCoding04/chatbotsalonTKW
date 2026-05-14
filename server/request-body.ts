@@ -6,6 +6,17 @@ export function readJsonBody(
   req: IncomingMessage,
   maxBytes = DEFAULT_MAX_BYTES,
 ): Promise<unknown> {
+  return readRawBody(req, maxBytes).then((raw) => {
+    const text = raw.toString('utf8').trim()
+    if (!text) return {}
+    return JSON.parse(text) as unknown
+  })
+}
+
+export function readRawBody(
+  req: IncomingMessage,
+  maxBytes = DEFAULT_MAX_BYTES,
+): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
     let total = 0
@@ -21,16 +32,7 @@ export function readJsonBody(
     })
 
     req.on('end', () => {
-      const raw = Buffer.concat(chunks).toString('utf8').trim()
-      if (!raw) {
-        resolve({})
-        return
-      }
-      try {
-        resolve(JSON.parse(raw))
-      } catch (e) {
-        reject(e)
-      }
+      resolve(Buffer.concat(chunks))
     })
 
     req.on('error', reject)

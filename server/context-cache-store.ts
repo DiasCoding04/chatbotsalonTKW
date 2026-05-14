@@ -21,6 +21,12 @@ export function clearSharedContextCacheStore(): void {
   inflight.clear()
 }
 
+/** Xoá cache theo đúng model + systemPrompt (vd. cache hết hạn trên Google nhưng entry local còn). */
+export function evictSharedContextCache(model: string, systemPrompt: string): void {
+  const fingerprint = buildContextCacheFingerprint(model, systemPrompt)
+  entries.delete(fingerprint)
+}
+
 export async function ensureSharedContextCache(
   apiKey: string,
   model: string,

@@ -1,1556 +1,1470 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
-import { flushSync } from 'react-dom'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import type { ChangeEvent, KeyboardEvent } from 'react'
 import './App.css'
-import {
-  type ChatImage,
-  type ChatTurn,
-  type UsageInfo,
-  type StreamTiming,
-  DEFAULT_MODEL,
-  countTextTokens,
-  streamGeminiReply,
-} from './lib/gemini'
-import { DEFAULT_OPENAI_MODEL, streamOpenaiReply } from './lib/openai'
-import {
-  MAX_CHAT_IMAGES,
-  readImageAttachment,
-} from './lib/image-attachments'
-import {
-  buildContextCacheFingerprint,
-  isSharedContextCacheValid,
-  readSharedContextCacheRecord,
-  resolveSharedContextCache,
-  SHARED_CONTEXT_CACHE_STORAGE_KEY,
-} from './lib/shared-context-cache'
-import { estimateUsd, getTariff } from './lib/gemini-pricing'
-import {
-  StreamingBubble,
-  type StreamingBubbleHandle,
-} from './components/StreamingBubble'
-import { ContextEditor } from './components/ContextEditor'
-import { ModelMessageBubbles } from './components/ModelMessageBubbles'
-import { fetchServerContext, fetchServerImageSamples } from './lib/context-api'
+import { BRANCH_PAGES } from '../shared/salon-ai-context.ts'
+import { TrainingChat } from './TrainingChat'
 
-type Msg = ChatTurn & {
-  usage?: UsageInfo
-  clientId?: string
-  replyToClientId?: string
-  /** Text hiển thị cho UI. Text gốc vẫn giữ nhẹ để gửi lại API ở lượt sau. */
-  displayText?: string
-}
+type TabKey = 'inbox' | 'training'
+type ConversationStatus = 'new' | 'ai' | 'human' | 'closed'
+type SyncState = 'idle' | 'syncing' | 'live' | 'needs-keys' | 'error'
 
-const CUSTOMER_QUIET_MS = 15_000
-const RETRY_BASE_MS = 1_500
-const RETRY_MAX_MS = 15_000
-
-function newClientId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID()
-  }
-  return `msg-${Date.now()}-${Math.random().toString(36).slice(2)}`
-}
-
-function buildChatHistoryForApi(msgs: Msg[]): ChatTurn[] {
-  return msgs
-    .filter((m) => m.role === 'user' || (m.role === 'model' && m.text.trim().length > 0))
-    .map(({ role, text, images }) => ({ role, text, images }))
-}
-
-function hasPendingCustomerMessages(msgs: Msg[]): boolean {
-  const history = buildChatHistoryForApi(msgs)
-  return history.length > 0 && history[history.length - 1]?.role === 'user'
-}
-
-type Stats = {
-  totalPrompt: number
-  totalCached: number
-  totalOutput: number
-  totalChatInput: number
-  calls: number
-}
-
-const EMPTY_STATS: Stats = {
-  totalPrompt: 0,
-  totalCached: 0,
-  totalOutput: 0,
-  totalChatInput: 0,
-  calls: 0,
-}
-
-const SALON_SYSTEM =
-  'Bạn là trợ lý ảo của một salon tóc. Trả lời ngắn gọn, lịch sự, tiếng Việt. ' +
-  'Giúp khách đặt lịch, tư vấn dịch vụ và giá theo ngữ cảnh được cung cấp bên dưới.'
-
-type BranchPage = {
-  id: number
+type Page = {
+  id: string
   name: string
-  address: string
-  hotline: string
+  avatarUrl?: string
+  unread: number
+  connected: boolean
+  defaultBranchPageId?: number
+  /** false = tắt AI tự động cho toàn fanpage (hội thoại vẫn có thể bật/tắt riêng). */
+  aiMasterEnabled?: boolean
 }
 
-const BRANCH_PAGES: BranchPage[] = [
-  { id: 1, name: 'CN 1 - Quận 1', address: '55 Phạm Viết Chánh, Cầu Ông Lãnh, Quận 1', hotline: '0935311111' },
-  { id: 2, name: 'CN 2 - Bình Tân', address: '202-204 Vành Đai Trong, Bình Trị Đông B, Bình Tân', hotline: '0935311111' },
-  { id: 3, name: 'CN 3 - Hóc Môn', address: '2/98A Lê Thị Hà, Hóc Môn', hotline: '0935311111' },
-  { id: 4, name: 'CN 4 - Quận 12', address: '1078 Nguyễn Ảnh Thủ, Quận 12', hotline: '0935311111' },
-  { id: 5, name: 'CN 5 - Gò Vấp', address: '397 Quang Trung, Phường 10, Gò Vấp', hotline: '0935311111' },
-  { id: 6, name: 'CN 6 - Thủ Đức', address: '734A Kha Vạn Cân, Linh Đông, Thủ Đức', hotline: '0935311111' },
-  { id: 7, name: 'CN 7 - Tân Phú', address: '109 Tân Sơn Nhì, Tân Sơn Nhì, Tân Phú', hotline: '0935311111' },
-  { id: 8, name: 'CN 8 - Quận 9', address: '427 Man Thiện, Phường Tăng Nhơn Phú, Quận 9', hotline: '0935311111' },
-  { id: 9, name: 'CN 9 - Thủ Dầu Một', address: '238 Đại Lộ Bình Dương, Thủ Dầu Một', hotline: '0935311111' },
-  { id: 10, name: 'CN 10 - Bến Cát', address: 'KDC Golden Centercity, Bến Cát', hotline: '0935311111' },
-  { id: 11, name: 'CN 11 - Thuận An', address: 'Ô94, DC30, Đường D1, KDC Vietsing, Thuận An', hotline: '0935311111' },
-  { id: 12, name: 'CN 12 - Tây Ninh', address: '24 Lãnh Binh Tòng, Trảng Bàng, Tây Ninh', hotline: '0935311111' },
-  { id: 13, name: 'CN 13 - Biên Hòa', address: '1118 Nguyễn Ái Quốc, Tân Phong, Biên Hòa', hotline: '0935311111' },
-  { id: 14, name: 'CN 14 - Phú Quốc', address: '120 Đường 30/4, TT Dương Đông, Phú Quốc', hotline: '0935311111' },
-  { id: 15, name: 'CN 15 - Đà Lạt', address: '33 Phan Bội Châu, Phường 1, TP Đà Lạt', hotline: '0935311111' },
-  { id: 16, name: 'CN 16 - Bình Phước', address: '483 Quốc Lộ 14, TX Đồng Xoài, Bình Phước', hotline: '0935311111' },
-  { id: 17, name: 'CN 17 - Tây Ninh', address: '953 Cách Mạng Tháng 8, TP Tây Ninh', hotline: '0935311111' },
-  { id: 18, name: 'CN 18 - Vũng Tàu', address: '496 Trương Công Định, Phường Vũng Tàu, TP.HCM', hotline: '0935311111' },
-  { id: 19, name: 'CN 19 - Nha Trang', address: '150 Nguyễn Thị Minh Khai, Phường Nha Trang, Khánh Hòa', hotline: '0935311111' },
-  { id: 20, name: 'CN 20 - An Giang', address: '125 Trần Quang Khải, Phường Rạch Giá, An Giang', hotline: '0935311111' },
-]
-
-function buildFanpagePrompt(branch: BranchPage): string {
-  return [
-    '--- Fanpage/chi nhánh đang nhắn ---',
-    `Khách đang nhắn fanpage ${branch.name}.`,
-    `Địa chỉ mặc định của fanpage này: ${branch.address}.`,
-    `Hotline/Zalo của fanpage này: ${branch.hotline}. Khi khách cần hotline/Zalo, ưu tiên gửi số này.`,
-    'Chỉ gửi địa chỉ chi nhánh mặc định khi khách hỏi địa chỉ/chi nhánh, hỏi salon ở đâu, cần đến salon kiểm tra, hoặc đã rõ dịch vụ + thời gian và cần xác nhận nơi ghé.',
-    'Khách chỉ nói "ghé", "chiều ghé", "tối ghé" là tín hiệu đặt lịch, không phải tín hiệu hỏi địa chỉ; khi chưa rõ dịch vụ/kiểu thì chỉ hỏi dịch vụ/kiểu còn thiếu, không tự đưa địa chỉ.',
-    'Khi gửi địa chỉ mặc định, phải hỏi khách có tiện qua địa chỉ đó không.',
-    'Nếu khách nói xa quá: nêu lý do xứng đáng để khách cân nhắc bỏ thời gian ghé (kỹ thuật xử lý, tư vấn trực tiếp, sản phẩm tốt, bảo hành/ưu đãi phù hợp).',
-    'Nếu khách vẫn không tiện: hỏi khu vực/địa chỉ của khách và tư vấn chi nhánh gần nhất theo danh sách chi nhánh trong CONTEXT.md.',
-  ].join('\n')
+type MessageReferral = {
+  adId?: string
+  title?: string
+  source?: string
+  type?: string
+  ref?: string
+  sourceUrl?: string
+  refererUri?: string
+  photoUrl?: string
+  videoUrl?: string
 }
 
-type ImageSampleGroup = {
-  key: string
-  label: string
-  usage: string
-  urls: string[]
+type Message = {
+  id: string
+  author: 'customer' | 'ai' | 'staff'
+  text: string
+  time: string
+  referralAdId?: string
+  imageUrl?: string
+  imageUrls?: string[]
+  videoUrls?: string[]
+  audioUrls?: string[]
+  referral?: MessageReferral
 }
 
-const IMAGE_SAMPLE_MARKER_RE = /\[\[\s*SEND_IMAGE\s*:\s*([a-z0-9_-]+)\s*\]\]/gi
-
-const IMAGE_SAMPLE_ALIASES: Record<string, string[]> = {
-  moi_noi_long_vu: ['moi noi long vu', 'hinh moi noi', 'mau moi noi'],
-  noi_toc: ['noi toc', 'mau noi toc', 'toc noi'],
-  noi_long_vu_den_chum_den: ['noi long vu den', 'chum toc den', 'toc noi mau den'],
-  toc_ngan_bob_tem: ['toc ngan', 'bob', 'toc tem', 'mau tem'],
-  mai_thua: ['mai thua'],
-  mai_bay: ['mai bay'],
-  mai_phap: ['mai phap'],
-  mai_ngang: ['mai ngang'],
-  duoi_ngan: ['duoi cup toc ngan', 'duoi thang toc ngan', 'toc ngan ngang vai'],
-  duoi_dai: ['duoi cup toc dai', 'duoi thang toc dai'],
-  uon_cup: ['uon cup'],
-  uon_song_ngan: ['uon song toc ngan', 'uon song ngan'],
-  uon_song_dai: ['uon song toc dai', 'uon song dai'],
-  uon_hippie: ['uon hippie', 'uon hippi', 'uon hippe', 'xu mi'],
-  uon_xoan_tang: ['uon xoan tang', 'xoan tang'],
-  uon_xoan_luoi_dai: ['uon xoan luoi dai', 'xoan luoi toc dai', 'uon loi toc dai'],
-  uon_xoan_luoi_ngan: ['uon xoan luoi ngan', 'xoan luoi toc ngan', 'uon loi toc ngan'],
-  nhuom_phu_bac: ['nhuom phu bac'],
-  phu_bac_mau_tram: ['phu bac mau tram', 'nhuom phu bac mau tram'],
-  toc_bac: ['toc bac', 'mau cho toc bac'],
-  mau_tram: ['mau tram', 'mau toi nhe'],
-  mau_thoi_trang: ['mau thoi trang', 'mau noi', 'mau ca tinh'],
-  mau_balayage: ['balayage'],
-  mau_babylight: ['baby light', 'babylight'],
-  nhuom_sang_khong_tay: ['nhuom sang khong can tay', 'mau sang khong tay', 'nhuom khong tay'],
-}
-
-function normalizeSearchText(text: string): string {
-  return text
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/đ/g, 'd')
-    .replace(/Đ/g, 'D')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, ' ')
-    .trim()
-}
-
-function slugifyImageSampleLabel(label: string): string {
-  const normalized = normalizeSearchText(label)
-  return (
-    normalized
-      .replace(/\b(url|anh|mau|dung|khi|khach|hoi|xem)\b/g, ' ')
-      .replace(/\s+/g, '_')
-      .replace(/^_+|_+$/g, '') || 'image_sample'
-  )
-}
-
-function imageSampleKeyForLabel(label: string): string {
-  const normalized = normalizeSearchText(label)
-  if (normalized.includes('moi noi long vu')) return 'moi_noi_long_vu'
-  if (normalized.includes('noi long vu den') || normalized.includes('chum toc den')) {
-    return 'noi_long_vu_den_chum_den'
+type Conversation = {
+  id: string
+  pageId: string
+  customerPsid: string
+  customer: string
+  avatar: string
+  avatarUrl?: string
+  title: string
+  status: ConversationStatus
+  aiEnabled: boolean
+  lastMessageAt: string
+  tags: string[]
+  messages: Message[]
+  sourceAd?: {
+    adId?: string
+    title?: string
+    source?: string
+    type?: string
+    ref?: string
+    refererUri?: string
+    sourceUrl?: string
+    photoUrl?: string
+    videoUrl?: string
   }
-  if (normalized.includes('noi toc')) return 'noi_toc'
-  if (normalized.includes('duoi') && normalized.includes('ngan')) return 'duoi_ngan'
-  if (normalized.includes('duoi') && normalized.includes('dai')) return 'duoi_dai'
-  if (normalized.includes('uon cup')) return 'uon_cup'
-  if (normalized.includes('uon song') && normalized.includes('ngan')) return 'uon_song_ngan'
-  if (normalized.includes('uon song') && normalized.includes('dai')) return 'uon_song_dai'
-  if (normalized.includes('hippie') || normalized.includes('hippi') || normalized.includes('hippe') || normalized.includes('xu mi')) {
-    return 'uon_hippie'
-  }
-  if (normalized.includes('xoan tang')) return 'uon_xoan_tang'
-  if (normalized.includes('xoan luoi') && normalized.includes('dai')) return 'uon_xoan_luoi_dai'
-  if (normalized.includes('xoan luoi') && normalized.includes('ngan')) return 'uon_xoan_luoi_ngan'
-  if (normalized.includes('toc ngan') || normalized.includes('bob') || normalized.includes('tem')) {
-    return 'toc_ngan_bob_tem'
-  }
-  if (normalized.includes('mai thua')) return 'mai_thua'
-  if (normalized.includes('mai bay')) return 'mai_bay'
-  if (normalized.includes('mai phap')) return 'mai_phap'
-  if (normalized.includes('mai ngang')) return 'mai_ngang'
-  if (normalized.includes('phu bac') && normalized.includes('mau tram')) return 'phu_bac_mau_tram'
-  if (normalized.includes('nhuom phu bac')) return 'nhuom_phu_bac'
-  if (normalized.includes('toc bac')) return 'toc_bac'
-  if (normalized.includes('mau tram')) return 'mau_tram'
-  if (normalized.includes('mau thoi trang')) return 'mau_thoi_trang'
-  if (normalized.includes('balayage')) return 'mau_balayage'
-  if (normalized.includes('baby light') || normalized.includes('babylight')) return 'mau_babylight'
-  if (normalized.includes('sang khong') || normalized.includes('khong can tay')) return 'nhuom_sang_khong_tay'
-  return slugifyImageSampleLabel(label)
+  customerReadAt?: string
+  pageDeliveredAt?: string
+  /** id BRANCH_PAGES — khi có, AI inbox dùng chi nhánh này. */
+  branchPageId?: number
+  aiEstimatedTotalUsd?: number
+  aiLastContextCacheHit?: boolean
+  aiLastRunAt?: string
 }
 
-function extractImageSampleUrls(text: string): string[] {
-  return Array.from(
-    new Set(
-      text.match(/(?:https?:\/\/[^\s),\]]+|(?:\.?\/)?images\/samples\/[^\s),\]]+)/g) ?? [],
-    ),
-  )
+type FacebookStatus = {
+  configured: boolean
+  appId: boolean
+  appSecret: boolean
+  pageAccessToken: boolean
+  pageTokenCount?: number
+  verifyToken: boolean
+  webhookUrl: string
+  /** Server: log JSON webhook ra stdout khi bật FACEBOOK_WEBHOOK_LOG_RAW_BODY */
+  webhookLogRawBody?: boolean
+  /** Server: ghi data/facebook-webhook-last.json mỗi webhook (tắt: FACEBOOK_WEBHOOK_NO_DEBUG_FILE=1). */
+  webhookDebugFile?: boolean
+  graphAttachmentsFallback?: boolean
 }
 
-function parseImageSampleGroups(markdown: string): ImageSampleGroup[] {
-  const groups: ImageSampleGroup[] = []
-  const seenKeys = new Set<string>()
-  for (const line of markdown.split(/\r?\n/)) {
-    const match = line.match(/^- URL\s+(.+?)\s+\((.+?)\):\s*(.+)$/)
-    if (!match) continue
-    const [, rawLabel, rawUsage, urlText] = match
-    const urls = extractImageSampleUrls(urlText)
-    if (!urls.length) continue
-    const label = rawLabel.trim().replace(/^ảnh mẫu\s+/i, '')
-    const usage = rawUsage.trim()
-    const baseKey = imageSampleKeyForLabel(label)
-    let key = baseKey
-    let suffix = 2
-    while (seenKeys.has(key)) {
-      key = `${baseKey}_${suffix}`
-      suffix += 1
-    }
-    seenKeys.add(key)
-    groups.push({ key, label, usage, urls })
-  }
-  return groups
-}
-
-function buildImageSampleCatalogPrompt(groups: ImageSampleGroup[]): string {
-  if (!groups.length) return ''
-  return [
-    '--- IMAGE SAMPLE ROUTER (không chứa URL) ---',
-    'App có database URL ảnh mẫu riêng, URL không nằm trong prompt để tiết kiệm chi phí.',
-    'Khi tư vấn dịch vụ/kiểu tóc có nhóm ảnh phù hợp, chủ động thêm marker đúng nhóm ở một dòng riêng: [[SEND_IMAGE:key]].',
-    'Không tự viết URL, không giải thích marker cho khách. App sẽ ẩn marker và thay bằng link ảnh thật.',
-    'Dùng tối đa 1-2 marker/lượt; chọn nhóm sát nhất với nhu cầu khách.',
-    'Khi ngữ cảnh là phủ bạc / tóc bạc / hòa bạc / nuôi bạc, chỉ dùng nhuom_phu_bac, phu_bac_mau_tram hoặc toc_bac; tuyệt đối không dùng mau_tram.',
-    'Các key ảnh mẫu:',
-    ...groups.map((group) => `- ${group.key}: ${group.label} (${group.usage})`),
-  ].join('\n')
-}
-
-function mergeContextWithImageSampleCatalog(
-  contextMd: string,
-  imageSampleGroups: ImageSampleGroup[],
-): string {
-  const context = contextMd.trim()
-  const imageCatalog = buildImageSampleCatalogPrompt(imageSampleGroups)
-  if (!imageCatalog) return context
-  return `${context}\n\n${imageCatalog}`.trim()
-}
-
-function compactLines(text: string): string {
-  return text
-    .split(/\r?\n/)
-    .map((line) => line.trimEnd())
-    .filter((line, index, lines) => line.trim() || (index > 0 && index < lines.length - 1))
-    .join('\n')
-    .trim()
-}
-
-function inferImageSampleKeys(text: string, groups: ImageSampleGroup[]): string[] {
-  const normalized = normalizeSearchText(text)
-  if (!/\b(anh|hinh|mau|tham khao|xem|gui)\b/.test(normalized)) return []
-  const keys: string[] = []
-  for (const group of groups) {
-    const aliases = IMAGE_SAMPLE_ALIASES[group.key] ?? [
-      normalizeSearchText(group.label),
-      normalizeSearchText(group.usage),
-    ]
-    if (aliases.some((alias) => alias && normalized.includes(alias))) {
-      keys.push(group.key)
-    }
-    if (keys.length >= 2) break
-  }
-  return keys
-}
-
-function isSilverCoverageContext(text: string): boolean {
-  const normalized = normalizeSearchText(text)
-  return /\b(phu bac|toc bac|bac trang|nhieu bac|hoa bac|nuoi bac)\b/.test(normalized)
-}
-
-function filterImageSampleKeysForContext(keys: string[], contextText: string): string[] {
-  if (!isSilverCoverageContext(contextText)) return keys
-  return keys.filter((key) => key !== 'mau_tram')
-}
-
-function expandModelImageSampleMarkers(
-  rawText: string,
-  groups: ImageSampleGroup[],
-  triggerText: string,
-): { apiText: string; displayText: string } {
-  const groupsByKey = new Map(groups.map((group) => [group.key, group]))
-  const markerKeys: string[] = []
-  let hadMarker = false
-  const textWithoutMarkers = rawText.replace(IMAGE_SAMPLE_MARKER_RE, (_marker, rawKey: string) => {
-    hadMarker = true
-    const key = rawKey.trim().toLowerCase()
-    if (groupsByKey.has(key) && !markerKeys.includes(key)) markerKeys.push(key)
-    return ''
-  })
-  const autoKeys =
-    markerKeys.length > 0 ? [] : inferImageSampleKeys(`${triggerText}\n${rawText}`, groups)
-  const keys = filterImageSampleKeysForContext(
-    [...markerKeys, ...autoKeys].filter((key, index, arr) => arr.indexOf(key) === index),
-    `${triggerText}\n${rawText}`,
-  )
-  if (!keys.length) {
-    const cleanText = hadMarker ? compactLines(textWithoutMarkers) : rawText
-    return { apiText: cleanText, displayText: cleanText }
-  }
-
-  const baseText = compactLines(textWithoutMarkers)
-  const apiAdditions: string[] = []
-  const displayAdditions: string[] = []
-  for (const key of keys) {
-    const group = groupsByKey.get(key)
-    if (!group) continue
-    apiAdditions.push(`Đã gửi ảnh mẫu: ${group.label}`)
-    displayAdditions.push([`Ảnh mẫu ${group.label}:`, ...group.urls].join('\n'))
-  }
-
-  return {
-    apiText: compactLines([baseText, ...apiAdditions].filter(Boolean).join('\n')),
-    displayText: compactLines([baseText, ...displayAdditions].filter(Boolean).join('\n')),
-  }
-}
-
-function buildSystemPrompt(contextMd: string, branch: BranchPage): string {
-  const trimmed = contextMd.trim()
-  const fanpagePrompt = buildFanpagePrompt(branch)
-  if (!trimmed) return `${SALON_SYSTEM}\n\n${fanpagePrompt}`
-  return `${SALON_SYSTEM}\n\n${fanpagePrompt}\n\n--- Ngữ cảnh salon (CONTEXT.md) ---\n\n${trimmed}`
-}
-
-const GEMINI_CONTEXT_CACHE_TTL_S = 3600
-
-/** Chờ Context Cache Gemini sẵn sàng (tránh lượt đầu gửi inline full CONTEXT). */
-function waitForContextCache(
-  getName: () => string | null | undefined,
-  timeoutMs: number,
-): Promise<string | undefined> {
-  const deadline = Date.now() + timeoutMs
-  return new Promise((resolve) => {
-    const tick = () => {
-      const name = getName()
-      if (name) {
-        resolve(name)
-        return
+type FacebookStoreMessage = {
+  id: string
+  author: 'customer' | 'page' | 'system'
+  text: string
+  timestamp: string
+  images?: string[]
+  videos?: string[]
+  audios?: string[]
+  referral?: {
+    adId?: string
+    title?: string
+    source?: string
+    type?: string
+    ref?: string
+    sourceUrl?: string
+    photoUrl?: string
+    videoUrl?: string
+    raw?: {
+      ads_context_data?: {
+        ad_title?: string
+        photo_url?: string
+        video_url?: string
       }
-      if (Date.now() >= deadline) {
-        resolve(undefined)
-        return
-      }
-      window.setTimeout(tick, 80)
     }
-    tick()
+  }
+}
+
+type FacebookStoreConversation = {
+  id: string
+  pageId: string
+  customerPsid: string
+  customerName?: string
+  avatarUrl?: string
+  title: string
+  lastMessageAt: string
+  ad?: FacebookStoreMessage['referral'] & { refererUri?: string }
+  messages: FacebookStoreMessage[]
+  customerReadAt?: string
+  pageDeliveredAt?: string
+  /** false = tắt AI tự động (lưu trên server). */
+  aiEnabled?: boolean
+  branchPageId?: number
+  aiEstimatedTotalUsd?: number
+  aiLastContextCacheHit?: boolean
+  aiLastRunAt?: string
+}
+
+type FacebookStorePage = {
+  id: string
+  name: string
+  avatarUrl?: string
+  connected: boolean
+  defaultBranchPageId?: number
+  aiMasterEnabled?: boolean
+}
+
+const STATUS_LABEL: Record<ConversationStatus, string> = {
+  new: 'Tin mới',
+  ai: 'AI đang xử lý',
+  human: 'Nhân viên',
+  closed: 'Đã xong',
+}
+
+function nowTime() {
+  return new Date().toLocaleTimeString('vi-VN', {
+    hour: '2-digit',
+    minute: '2-digit',
   })
 }
 
-/** Ước token khi không gọi API đếm (OpenAI). */
-function estimateTokensRough(text: string): number {
-  return Math.max(1, Math.ceil(text.length / 4))
+function formatMessageTime(value: string): string {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleTimeString('vi-VN', {
+    hour: '2-digit',
+    minute: '2-digit',
+  })
 }
 
-/** Hiển thị: mỗi dòng non-empty = 1 bong bóng. Giữ nguyên 1 tin trong state để API chuẩn. */
-function MessageImages({ images }: { images: ChatImage[] }) {
-  if (!images.length) return null
+function formatDateTime(value?: string): string {
+  if (!value) return 'Chưa có'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleString('vi-VN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    day: '2-digit',
+    month: '2-digit',
+  })
+}
+
+/** Quy đổi hiển thị chi phí AI inbox (USD ước tính → VND). */
+const INBOX_AI_USD_TO_VND = 26_000
+
+function formatInboxAiCostVnd(usd: number | undefined): string {
+  if (usd == null || !Number.isFinite(usd)) return '—'
+  const vnd = Math.round(usd * INBOX_AI_USD_TO_VND)
+  return `≈ ${vnd.toLocaleString('vi-VN')} ₫`
+}
+
+const PLACEHOLDER_NO_TEXT = '[Tin nhắn không có nội dung text]'
+const PLACEHOLDER_REFERRAL = '[Khách mở hội thoại từ nguồn referral]'
+
+function isPlaceholderInboxText(text?: string): boolean {
+  const t = text?.trim() ?? ''
+  return t === PLACEHOLDER_NO_TEXT || t === PLACEHOLDER_REFERRAL
+}
+
+function adContextFromRaw(raw: unknown): { title?: string; photoUrl?: string; videoUrl?: string } {
+  if (!raw || typeof raw !== 'object') return {}
+  const top = raw as Record<string, unknown>
+  const ads = top.ads_context_data
+  if (ads && typeof ads === 'object') {
+    const a = ads as { ad_title?: string; photo_url?: string; video_url?: string }
+    return {
+      title: typeof a.ad_title === 'string' ? a.ad_title : undefined,
+      photoUrl: typeof a.photo_url === 'string' ? a.photo_url : undefined,
+      videoUrl: typeof a.video_url === 'string' ? a.video_url : undefined,
+    }
+  }
+  return {}
+}
+
+/** Meta đôi khi lồng referral / ads_context_data sâu hơn một tầng */
+function deepFindAdsContextData(
+  node: unknown,
+  depth = 0,
+): { ad_title?: string; photo_url?: string; video_url?: string } | undefined {
+  if (depth > 8 || !node || typeof node !== 'object') return undefined
+  const n = node as Record<string, unknown>
+  const direct = n.ads_context_data
+  if (direct && typeof direct === 'object') return direct as { ad_title?: string; photo_url?: string; video_url?: string }
+  for (const key of Object.keys(n)) {
+    const found = deepFindAdsContextData(n[key], depth + 1)
+    if (found) return found
+  }
+  return undefined
+}
+
+function extractAdsContext(
+  ad?: MessageReferral | FacebookStoreMessage['referral'] | Conversation['sourceAd'] | null,
+): { title?: string; photoUrl?: string; videoUrl?: string } {
+  if (!ad || typeof ad !== 'object') return {}
+  const bag = ad as { raw?: unknown; ads_context_data?: unknown }
+  const fromTop = bag.ads_context_data
+  if (fromTop && typeof fromTop === 'object') {
+    const a = fromTop as { ad_title?: string; photo_url?: string; video_url?: string }
+    const t = typeof a.ad_title === 'string' ? a.ad_title : undefined
+    const p = typeof a.photo_url === 'string' ? a.photo_url : undefined
+    const v = typeof a.video_url === 'string' ? a.video_url : undefined
+    if (t || p || v) return { title: t, photoUrl: p, videoUrl: v }
+  }
+  let raw = bag.raw
+  if (typeof raw === 'string') {
+    try {
+      raw = JSON.parse(raw) as unknown
+    } catch {
+      raw = undefined
+    }
+  }
+  const shallow = adContextFromRaw(raw)
+  if (shallow.title || shallow.photoUrl || shallow.videoUrl) return shallow
+  const deepRaw = deepFindAdsContextData(raw)
+  if (deepRaw) {
+    return {
+      title: typeof deepRaw.ad_title === 'string' ? deepRaw.ad_title : undefined,
+      photoUrl: typeof deepRaw.photo_url === 'string' ? deepRaw.photo_url : undefined,
+      videoUrl: typeof deepRaw.video_url === 'string' ? deepRaw.video_url : undefined,
+    }
+  }
+  const deepAd = deepFindAdsContextData(ad)
+  if (deepAd) {
+    return {
+      title: typeof deepAd.ad_title === 'string' ? deepAd.ad_title : undefined,
+      photoUrl: typeof deepAd.photo_url === 'string' ? deepAd.photo_url : undefined,
+      videoUrl: typeof deepAd.video_url === 'string' ? deepAd.video_url : undefined,
+    }
+  }
+  return {}
+}
+
+function enrichAdLike(
+  ad?: MessageReferral | FacebookStoreMessage['referral'] | Conversation['sourceAd'] | null,
+): MessageReferral | undefined {
+  if (!ad) return undefined
+  const ctx = extractAdsContext(ad)
+  const ext = ad as { refererUri?: string; type?: string }
+  const out: MessageReferral = {
+    adId: ad.adId,
+    title: ad.title ?? ctx.title,
+    source: ad.source,
+    type: ext.type,
+    ref: ad.ref,
+    sourceUrl: ad.sourceUrl,
+    refererUri: ext.refererUri,
+    photoUrl: ad.photoUrl ?? ctx.photoUrl,
+    videoUrl: ad.videoUrl ?? ctx.videoUrl,
+  }
+  if (!out.adId && !out.title && !out.photoUrl && !out.videoUrl && !out.ref && !out.source && !out.sourceUrl)
+    return undefined
+  return out
+}
+
+function deriveConversationTitle(item: FacebookStoreConversation): string {
+  for (let i = item.messages.length - 1; i >= 0; i--) {
+    const t = item.messages[i]?.text?.trim()
+    if (t && !isPlaceholderInboxText(t)) return t.slice(0, 80)
+  }
+  const convAd = enrichAdLike(item.ad ?? undefined)
+  if (convAd?.title) return convAd.title.slice(0, 80)
+  if (convAd?.adId) return `Quảng cáo · ${convAd.adId.slice(0, 24)}`
+  for (let i = item.messages.length - 1; i >= 0; i--) {
+    const m = item.messages[i]
+    if (m?.images?.length || m?.videos?.length || m?.audios?.length) return `Ảnh / file · ${item.customerPsid.slice(-6)}`
+    const r = enrichAdLike(m?.referral ?? undefined)
+    if (r?.title) return r.title.slice(0, 80)
+  }
+  return item.title
+}
+
+function listTitleFromStored(item: FacebookStoreConversation): string {
+  if (!isPlaceholderInboxText(item.title)) return item.title
+  return deriveConversationTitle(item)
+}
+
+function urlLooksLikeStaticImage(url: string): boolean {
+  if (/\.(jpe?g|png|gif|webp)(\?|$)/i.test(url)) return true
+  // Meta hay đặt preview dạng ảnh JPG dưới key video_url (đường dẫn t15.*)
+  if (/fbcdn\.net\/v\/t15\./i.test(url) && /\.(jpe?g|png|webp)/i.test(url)) return true
+  return false
+}
+
+function urlLooksLikeAudioFile(url: string): boolean {
+  return /\.(mp3|aac|m4a|oga|ogg|opus|wav|weba|amr|3gp|caf)($|\?)/i.test(url.split(/[?#]/)[0])
+}
+
+function creativePreviewUrl(ad?: MessageReferral | null): string | undefined {
+  if (!ad) return undefined
+  if (ad.photoUrl) return ad.photoUrl
+  if (ad.videoUrl && urlLooksLikeStaticImage(ad.videoUrl)) return ad.videoUrl
+  return undefined
+}
+
+/** fbcdn thường chặn hotlink từ web app — tải qua proxy server. */
+function metaHostedMediaSrc(original: string): string {
+  if (!original.startsWith('http')) return original
+  try {
+    const h = new URL(original).hostname.toLowerCase()
+    if (
+      h.endsWith('fbcdn.net') ||
+      h === 'facebook.com' ||
+      h.endsWith('.facebook.com') ||
+      h.endsWith('fb.com') ||
+      h.endsWith('fbsbx.com')
+    ) {
+      return `/api/facebook/cdn-media?u=${encodeURIComponent(original)}`
+    }
+  } catch {
+    /* ignore */
+  }
+  return original
+}
+
+function AdCreativeMedia({ referral }: { referral: MessageReferral }) {
+  const original = creativePreviewUrl(referral)
+  if (original) {
+    const proxied = metaHostedMediaSrc(original)
+    return (
+      <img
+        className="bubble-ad-creative"
+        src={proxied}
+        alt=""
+        loading="lazy"
+        referrerPolicy="no-referrer"
+        onError={(ev) => {
+          const el = ev.currentTarget
+          if (el.dataset.fallback === '1') return
+          el.dataset.fallback = '1'
+          el.src = original
+        }}
+      />
+    )
+  }
+  if (referral.videoUrl)
+    return (
+      <video className="bubble-ad-video" src={referral.videoUrl} controls playsInline preload="metadata" />
+    )
+  return null
+}
+
+/** Voice thường là MP4 chỉ có track âm thanh — <video> tạo khung đen; chuyển sang <audio> khi không có khung hình. */
+function BubbleMessengerVideoOrAudio({ url, index }: { url: string; index: number }) {
+  const proxied = metaHostedMediaSrc(url)
+  const [asAudio, setAsAudio] = useState(() => urlLooksLikeAudioFile(url))
+
+  if (urlLooksLikeStaticImage(url)) {
+    return (
+      <img
+        key={`vimg-${index}`}
+        className="bubble-image"
+        src={proxied}
+        alt=""
+        loading="lazy"
+        referrerPolicy="no-referrer"
+        onError={(ev) => {
+          const el = ev.currentTarget
+          if (el.dataset.fallback === '1') return
+          el.dataset.fallback = '1'
+          el.src = url
+        }}
+      />
+    )
+  }
+
+  if (asAudio) {
+    return (
+      <audio
+        key={`fb-aud-${index}`}
+        className="bubble-audio"
+        src={proxied}
+        controls
+        preload="metadata"
+      />
+    )
+  }
+
   return (
-    <div className="msg-images">
-      {images.map((image, idx) =>
-        image.mimeType.startsWith('video/') ? (
-          <video key={`${image.mimeType}-${idx}`} src={image.dataUrl} controls playsInline preload="metadata">
-            Video {idx + 1}
-          </video>
-        ) : (
-          <img key={`${image.mimeType}-${idx}`} src={image.dataUrl} alt={`Ảnh ${idx + 1}`} />
-        ),
-      )}
+    <video
+      key={`fb-vid-${index}`}
+      className="bubble-video"
+      src={proxied}
+      controls
+      playsInline
+      preload="metadata"
+      onLoadedMetadata={(e) => {
+        const el = e.currentTarget
+        if (el.videoWidth === 0 && el.videoHeight === 0) setAsAudio(true)
+      }}
+    />
+  )
+}
+
+function MessageMediaGallery({
+  imageUrls,
+  videoUrls,
+  audioUrls,
+}: {
+  imageUrls?: string[]
+  videoUrls?: string[]
+  audioUrls?: string[]
+}) {
+  const imgs = imageUrls ?? []
+  const vids = videoUrls ?? []
+  const auds = audioUrls ?? []
+  if (!imgs.length && !vids.length && !auds.length) return null
+  return (
+    <div className="bubble-media-gallery">
+      {imgs.map((url, i) => {
+        const proxied = metaHostedMediaSrc(url)
+        if (urlLooksLikeAudioFile(url)) {
+          return (
+            <audio
+              key={`img-aud-${i}`}
+              className="bubble-audio"
+              src={proxied}
+              controls
+              preload="metadata"
+            />
+          )
+        }
+        return (
+          <img
+            key={`img-${i}`}
+            className="bubble-image"
+            src={proxied}
+            alt=""
+            loading="lazy"
+            referrerPolicy="no-referrer"
+            onError={(ev) => {
+              const el = ev.currentTarget
+              if (el.dataset.fallback === '1') return
+              el.dataset.fallback = '1'
+              el.src = url
+            }}
+          />
+        )
+      })}
+      {auds.map((url, i) => (
+        <audio
+          key={`aud-${i}`}
+          className="bubble-audio"
+          src={metaHostedMediaSrc(url)}
+          controls
+          preload="metadata"
+        />
+      ))}
+      {vids.map((url, i) => (
+        <BubbleMessengerVideoOrAudio key={`vid-wrap-${i}`} url={url} index={i} />
+      ))}
     </div>
   )
 }
 
-type CtxTokenMetrics = { file: number; systemFull: number }
-
-function chatHistoryTokens(promptTotal: number, systemFull: number | null): number | null {
-  if (systemFull == null) return null
-  return Math.max(0, promptTotal - systemFull)
+function mapStoredConversation(item: FacebookStoreConversation): Conversation {
+  const fallbackName = `Khách ${item.customerPsid.slice(-6)}`
+  const customer = item.customerName?.trim() || fallbackName
+  return {
+    id: item.id,
+    pageId: item.pageId,
+    customerPsid: item.customerPsid,
+    customer,
+    avatar:
+      customer
+        .split(/\s+/)
+        .filter(Boolean)
+        .slice(-2)
+        .map((part) => part[0]?.toUpperCase() ?? '')
+        .join('') || item.customerPsid.slice(-2).toUpperCase(),
+    avatarUrl: item.avatarUrl,
+    title: listTitleFromStored(item),
+    status: item.aiEnabled === false ? 'human' : 'ai',
+    aiEnabled: item.aiEnabled !== false,
+    lastMessageAt: formatMessageTime(item.lastMessageAt),
+    tags: [
+      item.ad?.adId ? 'Từ quảng cáo' : 'Facebook',
+      item.customerReadAt ? 'Khách đã đọc' : 'Tin mới',
+    ],
+    messages: item.messages.map((message) => {
+      const referral = enrichAdLike(message.referral ?? undefined)
+      return {
+        id: message.id,
+        author: message.author === 'page' ? 'staff' : message.author === 'system' ? 'ai' : 'customer',
+        text: message.text,
+        time: formatMessageTime(message.timestamp),
+        referralAdId: referral?.adId ?? message.referral?.adId,
+        referral,
+        imageUrls: message.images,
+        videoUrls: message.videos,
+        audioUrls: message.audios,
+      }
+    }),
+    sourceAd: enrichAdLike(item.ad ?? undefined),
+    customerReadAt: item.customerReadAt,
+    pageDeliveredAt: item.pageDeliveredAt,
+    branchPageId: item.branchPageId,
+    aiEstimatedTotalUsd: item.aiEstimatedTotalUsd,
+    aiLastContextCacheHit: item.aiLastContextCacheHit,
+    aiLastRunAt: item.aiLastRunAt,
+  }
 }
 
-function UsageLine({
-  u,
-  metrics,
-  contextMetricsApprox,
-}: {
-  u: UsageInfo
-  metrics: CtxTokenMetrics | null
-  contextMetricsApprox?: boolean
-}) {
-  const chatT = chatHistoryTokens(u.promptTokens, metrics?.systemFull ?? null)
+function Avatar({ conversation, large = false }: { conversation: Conversation; large?: boolean }) {
   return (
-    <span className="usage">
-      {' '}
-      · in {u.promptTokens}
-      {metrics != null && chatT != null && (
-        <>
-          {' '}
-          (
-          <span
-            title={
-              contextMetricsApprox
-                ? 'Ước token CONTEXT.md (chars/4) — không gọi API đếm'
-                : 'Chỉ nội dung public/CONTEXT.md (đếm countTokens riêng)'
-            }
-          >
-            CONTEXT.md {metrics.file}
-          </span>
-          {' · '}
-          <span title="Tổng input API trừ cả khối systemInstruction (tiền tố salon + CONTEXT.md). = tin nhắn hội thoại">
-            hội thoại {chatT}
-          </span>
-          )
-        </>
+    <span className={large ? 'avatar large' : 'avatar'}>
+      {conversation.avatarUrl ? (
+        <img src={conversation.avatarUrl} alt={conversation.customer} />
+      ) : (
+        conversation.avatar
       )}
-      {u.cachedTokens > 0 && <> (cached {u.cachedTokens})</>}
-      {' '}
-      / out {u.outputTokens}
     </span>
   )
 }
 
-type ContextBanner = { level: 'ok' | 'warn' | 'error'; message: string } | null
-type CacheStatus =
-  | { kind: 'idle' }
-  | { kind: 'loading' }
-  | { kind: 'ready'; name: string }
-  | { kind: 'error'; message: string }
-
-type LastPerf = {
-  timing: StreamTiming
-  /** performance.now() từ đầu send() → sau await stream (gồm React nhẹ). */
-  msClientRoundTrip: number
-}
-
-function fmtMs(ms: number) {
-  return `${ms < 10 ? ms.toFixed(1) : Math.round(ms)} ms`
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, ms))
-}
-
-type AppProps = {
-  forcedProvider?: 'gemini' | 'openai'
-  forcedModel?: string
-  title?: string
-}
-
-export default function App({ forcedProvider, forcedModel, title }: AppProps = {}) {
-  const aiProvider = (forcedProvider ?? import.meta.env.VITE_AI_PROVIDER ?? 'gemini')
-    .toLowerCase()
-    .trim()
-  const isGemini = aiProvider === 'gemini'
-
-  const apiKey = isGemini
-    ? (import.meta.env.VITE_GEMINI_API_KEY ?? '').trim()
-    : (import.meta.env.VITE_OPENAI_API_KEY ?? '').trim()
-  const geminiProxyInjectsKey =
-    isGemini && import.meta.env.VITE_GEMINI_PROXY_INJECTS_KEY === 'true'
-  const geminiReady = Boolean(apiKey.trim() || geminiProxyInjectsKey)
-  const model = (
-    forcedModel?.trim() ||
-    (isGemini
-      ? (import.meta.env.VITE_GEMINI_MODEL as string | undefined)?.trim() || DEFAULT_MODEL
-      : (import.meta.env.VITE_OPENAI_MODEL as string | undefined)?.trim() || DEFAULT_OPENAI_MODEL)
+function PageAvatar({ page }: { page: Page }) {
+  return (
+    <span className="page-icon">
+      {page.avatarUrl ? <img src={page.avatarUrl} alt={page.name} /> : page.name.slice(0, 1)}
+    </span>
   )
-  /**
-   * Salon: câu ngắn — max nhỏ → model dừng sớm, stream kết thúc nhanh hơn.
-   * Có thể tăng qua VITE_MAX_OUTPUT_TOKENS (vd 512 / 768).
-   */
-  const maxOutputTokens = Number(import.meta.env.VITE_MAX_OUTPUT_TOKENS) || 256
+}
 
-  const [contextMd, setContextMd] = useState('')
-  const [imageSamplesMd, setImageSamplesMd] = useState('')
-  const [contextBanner, setContextBanner] = useState<ContextBanner>(null)
-  const [contextFromServer, setContextFromServer] = useState(false)
-  const [contextRequiresEditToken, setContextRequiresEditToken] = useState(false)
-  const [contextEditorOpen, setContextEditorOpen] = useState(false)
-  const [messages, setMessages] = useState<Msg[]>([])
-  const [stats, setStats] = useState<Stats>(EMPTY_STATS)
-  const [input, setInput] = useState('')
-  const [pendingImages, setPendingImages] = useState<ChatImage[]>([])
-  const [attachError, setAttachError] = useState<string | null>(null)
-  const [loading, setLoading] = useState(false)
-  const [awaitingCustomer, setAwaitingCustomer] = useState(false)
-  const [streamingUserClientId, setStreamingUserClientId] = useState<string | null>(null)
-  const [ctxMetrics, setCtxMetrics] = useState<CtxTokenMetrics | null>(null)
-  const [lastPerf, setLastPerf] = useState<LastPerf | null>(null)
-  const [cacheStatus, setCacheStatus] = useState<CacheStatus>({ kind: 'idle' })
-  const [waitModeEnabled, setWaitModeEnabled] = useState(false)
-  const [selectedBranchId, setSelectedBranchId] = useState(1)
+function facebookSetupMessage(status: FacebookStatus | null): string {
+  if (!status) return 'Đang kiểm tra kết nối fanpage...'
+  const missing = [
+    !status.appId ? 'App ID' : '',
+    !status.appSecret ? 'App Secret' : '',
+    !status.pageAccessToken ? 'Page Access Token' : '',
+    !status.verifyToken ? 'Verify Token' : '',
+  ].filter(Boolean)
+  if (!missing.length) {
+    return 'Tin nhắn từ khách qua fanpage sẽ hiện ở đây và được cập nhật liên tục.'
+  }
+  if (status.pageTokenCount) {
+    return 'Kết nối Facebook chưa hoàn tất. Vui lòng liên hệ người phụ trách hệ thống.'
+  }
+  return 'Chưa kết nối được Facebook. Liên hệ người phụ trách để bật kết nối.'
+}
 
-  const chatEndRef = useRef<HTMLDivElement>(null)
-  const streamingRef = useRef<StreamingBubbleHandle>(null)
-  const imageInputRef = useRef<HTMLInputElement>(null)
-  /** Hủy countTokens nền khi user gửi chat — không hủy createCachedContent. */
-  const metricsAbortRef = useRef<AbortController | null>(null)
-  const bgMetricsTimerRef = useRef<number>(0)
-  const cacheNameRef = useRef<string | null>(null)
-  const processingRef = useRef(false)
-  const messagesRef = useRef<Msg[]>([])
-  const debounceTimerRef = useRef<number>(0)
-  const debounceGenerationRef = useRef(0)
+function syncCardTitle(state: SyncState): string {
+  switch (state) {
+    case 'live':
+      return 'Đã kết nối fanpage'
+    case 'syncing':
+      return 'Đang đồng bộ'
+    case 'needs-keys':
+      return 'Chưa kết nối đủ'
+    case 'error':
+      return 'Không kết nối được'
+    default:
+      return 'Fanpage'
+  }
+}
 
-  useEffect(() => {
-    messagesRef.current = messages
-  }, [messages])
+async function fetchFacebookStatus(): Promise<FacebookStatus | null> {
+  const res = await fetch('/api/facebook/status', { cache: 'no-store' })
+  if (res.status === 404) return null
+  if (!res.ok) throw new Error(`Không kiểm tra được kết nối Facebook (${res.status}).`)
+  return (await res.json()) as FacebookStatus
+}
 
-  useEffect(() => {
-    return () => {
-      window.clearTimeout(debounceTimerRef.current)
+async function patchFacebookConversationApi(
+  conversationId: string,
+  patch: { aiEnabled?: boolean; branchPageId?: number | null },
+): Promise<void> {
+  const res = await fetch('/api/facebook/conversation', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ conversationId, ...patch }),
+  })
+  const body = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string }
+  if (!res.ok || body.ok === false) throw new Error(body.error || `Không cập nhật được hội thoại (${res.status}).`)
+}
+
+async function patchFacebookPageApi(
+  pageId: string,
+  patch: { defaultBranchPageId?: number | null; aiMasterEnabled?: boolean },
+): Promise<void> {
+  const res = await fetch('/api/facebook/page', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ pageId, ...patch }),
+  })
+  const body = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string }
+  if (!res.ok || body.ok === false) throw new Error(body.error || `Không cập nhật được fanpage (${res.status}).`)
+}
+
+async function fetchFacebookInboxData(): Promise<{ pages: Page[]; conversations: Conversation[] }> {
+  const res = await fetch('/api/facebook/conversations', { cache: 'no-store' })
+  if (res.status === 404) return { pages: [], conversations: [] }
+  if (!res.ok) throw new Error(`Không tải được hội thoại Facebook (${res.status}).`)
+  const body = (await res.json()) as {
+    pages?: FacebookStorePage[]
+    conversations?: FacebookStoreConversation[]
+  }
+  const conversations = (body.conversations ?? []).map(mapStoredConversation)
+  const unreadByPage = new Map<string, number>()
+  for (const conversation of conversations) {
+    if (conversation.status === 'new') {
+      unreadByPage.set(conversation.pageId, (unreadByPage.get(conversation.pageId) ?? 0) + 1)
     }
-  }, [])
+  }
+  return {
+    pages: (body.pages ?? []).map((page) => ({
+      id: page.id,
+      name: page.name,
+      avatarUrl: page.avatarUrl,
+      unread: unreadByPage.get(page.id) ?? 0,
+      connected: page.connected,
+      defaultBranchPageId: page.defaultBranchPageId,
+      aiMasterEnabled: page.aiMasterEnabled,
+    })),
+    conversations,
+  }
+}
+async function triggerFacebookSync() {
+  const res = await fetch('/api/facebook/sync', { method: 'POST' })
+  const body = (await res.json().catch(() => ({}))) as {
+    ok?: boolean
+    error?: string
+    pages?: FacebookStorePage[]
+  }
+  if (!res.ok) throw new Error(body.error || `Không đồng bộ được Facebook (${res.status}).`)
+  return body
+}
 
-  const commitMessages = useCallback((updater: (prev: Msg[]) => Msg[]) => {
-    flushSync(() => {
-      setMessages((prev) => {
-        const next = updater(prev)
-        messagesRef.current = next
-        return next
-      })
-    })
-  }, [])
+function App() {
+  const [activeTab, setActiveTab] = useState<TabKey>('inbox')
+  const [pages, setPages] = useState<Page[]>([])
+  const [selectedPageId, setSelectedPageId] = useState('all')
+  const [conversations, setConversations] = useState<Conversation[]>([])
+  const [selectedConversationId, setSelectedConversationId] = useState('')
+  const [draft, setDraft] = useState('')
+  const [pendingImage, setPendingImage] = useState<{ dataUrl: string; name: string } | null>(null)
+  const composerFileRef = useRef<HTMLInputElement>(null)
+  const messageFeedRef = useRef<HTMLDivElement>(null)
+  const [syncState, setSyncState] = useState<SyncState>('idle')
+  const [syncMessage, setSyncMessage] = useState('Đang kiểm tra kết nối fanpage...')
+  const [facebookStatus, setFacebookStatus] = useState<FacebookStatus | null>(null)
+  const [facebookConversationError, setFacebookConversationError] = useState<string | null>(null)
+  const [facebookSendBusy, setFacebookSendBusy] = useState(false)
+  const [pageSettingsPageId, setPageSettingsPageId] = useState<string | null>(null)
+  const [pageModalBranch, setPageModalBranch] = useState('')
+  const [pageModalMasterAi, setPageModalMasterAi] = useState(true)
 
-  const loadContext = useCallback(async () => {
-    setContextBanner(null)
-    const loadImageSamples = async (): Promise<string> => {
+  useEffect(() => {
+    let alive = true
+
+    const load = async () => {
       try {
-        const serverDoc = await fetchServerImageSamples()
-        if (serverDoc) return serverDoc.content
-      } catch {
-        // Fall back to the static public file below.
-      }
-
-      try {
-        const res = await fetch('/IMAGE_SAMPLES.md', { cache: 'no-store' })
-        if (!res.ok) throw new Error(`${res.status}`)
-        return await res.text()
-      } catch {
-        try {
-          const { default: fallback } = await import('./context/IMAGE_SAMPLES.fallback.md?raw')
-          return fallback
-        } catch {
-          return ''
+        const status = await fetchFacebookStatus()
+        if (!alive) return
+        setFacebookStatus(status)
+        if (status?.configured) {
+          setSyncState('live')
+          setSyncMessage(facebookSetupMessage(status))
+        } else {
+          setSyncState('needs-keys')
+          setSyncMessage(facebookSetupMessage(status))
         }
+      } catch (e) {
+        if (!alive) return
+        setSyncState('error')
+        setSyncMessage(e instanceof Error ? e.message : String(e))
       }
     }
 
-    try {
-      const serverDoc = await fetchServerContext()
-      if (serverDoc) {
-        setContextFromServer(true)
-        setContextRequiresEditToken(serverDoc.requiresEditToken)
-        setImageSamplesMd(await loadImageSamples())
-        setContextMd(serverDoc.content)
-        return
-      }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      setContextBanner({
-        level: 'warn',
-        message: `${msg} Đang thử tải bản tĩnh public/CONTEXT.md.`,
-      })
-    }
-
-    setContextFromServer(false)
-    setContextRequiresEditToken(false)
-    try {
-      const res = await fetch('/CONTEXT.md', { cache: 'no-store' })
-      if (!res.ok) throw new Error(`${res.status}`)
-      setImageSamplesMd(await loadImageSamples())
-      setContextMd(await res.text())
-    } catch {
-      try {
-        const { default: fallback } = await import('./context/CONTEXT.fallback.md?raw')
-        setImageSamplesMd(await loadImageSamples())
-        setContextMd(fallback)
-        setContextBanner({
-          level: 'warn',
-          message:
-            'Không tải được CONTEXT từ server hoặc public/CONTEXT.md — đang dùng bản nhúng trong mã nguồn.',
-        })
-      } catch {
-        setImageSamplesMd('')
-        setContextMd('')
-        setContextBanner({
-          level: 'error',
-          message:
-            'Không đọc được ngữ cảnh. Kiểm tra server /api/context, public/CONTEXT.md và CONTEXT.fallback.md.',
-        })
-      }
+    void load()
+    const timer = window.setInterval(() => void load(), 30_000)
+    return () => {
+      alive = false
+      window.clearInterval(timer)
     }
   }, [])
 
   useEffect(() => {
-    void loadContext()
-  }, [loadContext])
+    let alive = true
 
-  const selectedBranch = useMemo(
-    () => BRANCH_PAGES.find((branch) => branch.id === selectedBranchId) ?? BRANCH_PAGES[0],
-    [selectedBranchId],
-  )
-  const imageSampleGroups = useMemo(
-    () => parseImageSampleGroups(imageSamplesMd),
-    [imageSamplesMd],
-  )
-  const promptContextMd = useMemo(
-    () => mergeContextWithImageSampleCatalog(contextMd, imageSampleGroups),
-    [contextMd, imageSampleGroups],
-  )
-  const systemPrompt = useMemo(
-    () => buildSystemPrompt(promptContextMd, selectedBranch),
-    [promptContextMd, selectedBranch],
-  )
-  const contextCacheFingerprint = useMemo(
-    () =>
-      isGemini && systemPrompt.trim() ? buildContextCacheFingerprint(model, systemPrompt) : null,
-    [isGemini, model, systemPrompt],
-  )
+    const load = async () => {
+      try {
+        const inboxData = await fetchFacebookInboxData()
+        if (!alive) return
+        setPages(inboxData.pages)
+        setConversations(inboxData.conversations)
+        if (inboxData.conversations.length) {
+          setSelectedConversationId((current) =>
+            inboxData.conversations.some((item) => item.id === current) ? current : inboxData.conversations[0].id,
+          )
+        } else {
+          setSelectedConversationId('')
+        }
+        setFacebookConversationError(null)
+      } catch (e) {
+        if (!alive) return
+        setFacebookConversationError(e instanceof Error ? e.message : String(e))
+      }
+    }
 
-  /** OpenAI: ước token CONTEXT cục bộ (không gọi API đếm). */
+    void load()
+    const timer = window.setInterval(() => void load(), 4_000)
+    return () => {
+      alive = false
+      window.clearInterval(timer)
+    }
+  }, [])
+
   useEffect(() => {
-    if (isGemini) return
-    if (!apiKey.trim() || !promptContextMd.trim()) {
-      setCtxMetrics(null)
-      return
-    }
-      const t = window.setTimeout(() => {
-        const fileText = promptContextMd.trim()
-        setCtxMetrics({
-          file: estimateTokensRough(fileText),
-          systemFull: estimateTokensRough(buildSystemPrompt(promptContextMd, selectedBranch)),
-        })
-      }, 200)
-    return () => window.clearTimeout(t)
-  }, [isGemini, geminiReady, promptContextMd, apiKey, selectedBranch])
+    setPendingImage(null)
+  }, [selectedConversationId])
 
-  /** Gemini: cache toàn bộ systemPrompt (tiền tố salon + CONTEXT.md) qua Context Cache API. */
   useEffect(() => {
-    if (!isGemini) {
-      cacheNameRef.current = null
-      setCacheStatus({ kind: 'idle' })
+    if (!pageSettingsPageId) return
+    const p = pages.find((x) => x.id === pageSettingsPageId)
+    if (!p) {
+      setPageSettingsPageId(null)
       return
     }
-    if (!geminiReady || !systemPrompt.trim()) {
-      cacheNameRef.current = null
-      setCacheStatus({ kind: 'idle' })
-      return
+    setPageModalBranch(p.defaultBranchPageId != null ? String(p.defaultBranchPageId) : '')
+    setPageModalMasterAi(p.aiMasterEnabled !== false)
+  }, [pageSettingsPageId, pages])
+
+  useEffect(() => {
+    if (!pageSettingsPageId) return
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Escape') setPageSettingsPageId(null)
     }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [pageSettingsPageId])
 
-    let cancelled = false
-    cacheNameRef.current = null
-    setCacheStatus({ kind: 'loading' })
+  const filteredConversations = useMemo(() => {
+    if (selectedPageId === 'all') return conversations
+    return conversations.filter((item) => item.pageId === selectedPageId)
+  }, [conversations, selectedPageId])
 
+  const selectedConversation =
+    conversations.find((item) => item.id === selectedConversationId) ?? filteredConversations[0] ?? conversations[0]
+
+  const inboxMessagesScrollKey = useMemo(() => {
+    if (!selectedConversation) return ''
+    const msgs = selectedConversation.messages
+    const last = msgs[msgs.length - 1]
+    return `${selectedConversation.id}|${msgs.length}|${last?.id ?? ''}|${last?.time ?? ''}`
+  }, [selectedConversation])
+
+  useLayoutEffect(() => {
+    const el = messageFeedRef.current
+    if (!el || !inboxMessagesScrollKey) return
+    el.scrollTop = el.scrollHeight
+  }, [inboxMessagesScrollKey])
+
+  const selectedPage = pages.find((page) => page.id === selectedConversation?.pageId)
+
+  const pageSettingsTotalUsd = useMemo(() => {
+    if (!pageSettingsPageId) return 0
+    return conversations.reduce(
+      (sum, c) => (c.pageId === pageSettingsPageId ? sum + (c.aiEstimatedTotalUsd ?? 0) : sum),
+      0,
+    )
+  }, [pageSettingsPageId, conversations])
+
+  const totalUnread = pages.reduce((sum, page) => sum + page.unread, 0)
+  const aiActive = conversations.filter((item) => item.aiEnabled).length
+  const needsHuman = conversations.filter((item) => item.status === 'human').length
+
+  const updateConversation = (id: string, updater: (conversation: Conversation) => Conversation) => {
+    setConversations((items) => items.map((item) => (item.id === id ? updater(item) : item)))
+  }
+
+  const handleSync = async () => {
+    setSyncState('syncing')
+    setSyncMessage('Đang đồng bộ dữ liệu fanpage...')
+    try {
+      const result = await triggerFacebookSync()
+      if (Array.isArray(result.pages)) {
+        setPages(
+          result.pages.map((page) => ({
+            id: page.id,
+            name: page.name,
+            avatarUrl: page.avatarUrl,
+            unread: 0,
+            connected: page.connected,
+            defaultBranchPageId: page.defaultBranchPageId,
+            aiMasterEnabled: page.aiMasterEnabled,
+          })),
+        )
+      }
+      setSyncState(facebookStatus?.configured ? 'live' : 'needs-keys')
+      setSyncMessage(
+        facebookStatus?.configured ? 'Danh sách fanpage đã được cập nhật.' : facebookSetupMessage(facebookStatus),
+      )
+    } catch (e) {
+      setSyncState('error')
+      setSyncMessage(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  const toggleAi = (id: string) => {
+    const current = conversations.find((c) => c.id === id)
+    if (!current) return
+    const nextAi = !current.aiEnabled
+    updateConversation(id, (conversation) => ({
+      ...conversation,
+      aiEnabled: nextAi,
+      status: nextAi ? 'ai' : 'human',
+    }))
+    void patchFacebookConversationApi(id, { aiEnabled: nextAi }).catch((err) => {
+      setFacebookConversationError(err instanceof Error ? err.message : String(err))
+      updateConversation(id, (conversation) => ({
+        ...conversation,
+        aiEnabled: current.aiEnabled,
+        status: current.aiEnabled ? 'ai' : 'human',
+      }))
+    })
+  }
+
+  const savePageSettingsModal = () => {
+    if (!pageSettingsPageId) return
     void (async () => {
       try {
-        const { name } = await resolveSharedContextCache(
-          apiKey,
-          model,
-          systemPrompt,
-          GEMINI_CONTEXT_CACHE_TTL_S,
+        const branchVal = pageModalBranch === '' ? null : Number(pageModalBranch)
+        await patchFacebookPageApi(pageSettingsPageId, {
+          defaultBranchPageId: branchVal,
+          aiMasterEnabled: pageModalMasterAi,
+        })
+        setPages((prev) =>
+          prev.map((p) => {
+            if (p.id !== pageSettingsPageId) return p
+            return {
+              ...p,
+              aiMasterEnabled: pageModalMasterAi,
+              defaultBranchPageId: pageModalBranch === '' ? undefined : Number(pageModalBranch),
+            }
+          }),
         )
-        if (cancelled) return
-        cacheNameRef.current = name
-        setCacheStatus({ kind: 'ready', name })
-      } catch (e) {
-        if (cancelled) return
-        cacheNameRef.current = null
-        const msg = e instanceof Error ? e.message : String(e)
-        setCacheStatus({ kind: 'error', message: msg })
+        setFacebookConversationError(null)
+        setPageSettingsPageId(null)
+      } catch (err) {
+        setFacebookConversationError(err instanceof Error ? err.message : String(err))
       }
     })()
-
-    return () => {
-      cancelled = true
-      cacheNameRef.current = null
-    }
-  }, [isGemini, apiKey, geminiReady, model, systemPrompt])
-
-  useEffect(() => {
-    if (!isGemini || !contextCacheFingerprint) return
-    const syncFromStorage = () => {
-      const record = readSharedContextCacheRecord()
-      if (!record || !isSharedContextCacheValid(record, contextCacheFingerprint)) return
-      cacheNameRef.current = record.name
-      setCacheStatus({ kind: 'ready', name: record.name })
-    }
-    const onStorage = (event: StorageEvent) => {
-      if (event.key !== SHARED_CONTEXT_CACHE_STORAGE_KEY) return
-      syncFromStorage()
-    }
-    window.addEventListener('storage', onStorage)
-    return () => window.removeEventListener('storage', onStorage)
-  }, [isGemini, contextCacheFingerprint])
-
-  /** Gemini: đếm token CONTEXT (UI chi phí) — chạy nền, có thể hủy khi user gửi chat. */
-  useEffect(() => {
-    if (!isGemini) return
-    if (!geminiReady || !promptContextMd.trim()) {
-      setCtxMetrics(null)
-      return
-    }
-
-    metricsAbortRef.current?.abort()
-    const ac = new AbortController()
-    metricsAbortRef.current = ac
-
-    const fileText = promptContextMd.trim()
-    const fullSystem = buildSystemPrompt(promptContextMd, selectedBranch)
-    const METRICS_DELAY_MS = 3000
-
-    window.clearTimeout(bgMetricsTimerRef.current)
-    bgMetricsTimerRef.current = window.setTimeout(() => {
-      void (async () => {
-        try {
-          const [fp, sp] = await Promise.all([
-            countTextTokens(apiKey, model, fileText, ac.signal),
-            countTextTokens(apiKey, model, fullSystem, ac.signal),
-          ])
-          if (!ac.signal.aborted) setCtxMetrics({ file: fp, systemFull: sp })
-        } catch (e) {
-          if (ac.signal.aborted || (e instanceof Error && e.name === 'AbortError')) return
-          setCtxMetrics(null)
-        }
-      })()
-    }, METRICS_DELAY_MS)
-
-    return () => {
-      window.clearTimeout(bgMetricsTimerRef.current)
-      ac.abort()
-    }
-  }, [isGemini, apiKey, geminiReady, promptContextMd, model, systemPrompt, selectedBranch])
-
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, loading])
-
-  async function onPickImages(e: ChangeEvent<HTMLInputElement>) {
-    const files = Array.from(e.target.files ?? [])
-    e.target.value = ''
-    if (!files.length) return
-    setAttachError(null)
-    const room = MAX_CHAT_IMAGES - pendingImages.length
-    if (room <= 0) {
-      setAttachError(`Tối đa ${MAX_CHAT_IMAGES} ảnh/video mỗi tin.`)
-      return
-    }
-    const picked = files.slice(0, room)
-    try {
-      const next = await Promise.all(picked.map((file) => readImageAttachment(file)))
-      setPendingImages((prev) => [...prev, ...next])
-    } catch (err) {
-      setAttachError(err instanceof Error ? err.message : String(err))
-    }
   }
 
-  function removePendingImage(index: number) {
-    setPendingImages((prev) => prev.filter((_, i) => i !== index))
-    setAttachError(null)
-  }
+  const sendStaffMessage = async () => {
+    if (!selectedConversation) return
+    const text = draft.trim()
+    const imageUrl = pendingImage?.dataUrl
+    if (!text && !imageUrl) return
 
-  async function resolveCachedContentForSend(): Promise<string | undefined> {
-    if (!isGemini) return undefined
-
-    let cachedContent = cacheNameRef.current ?? undefined
-    if (!cachedContent) {
-      cachedContent = await waitForContextCache(() => cacheNameRef.current, 20_000)
-    }
-    if (!cachedContent && systemPrompt.trim()) {
+    if (facebookStatus?.configured) {
+      setFacebookSendBusy(true)
       try {
-        const { name } = await resolveSharedContextCache(
-          apiKey,
-          model,
-          systemPrompt,
-          GEMINI_CONTEXT_CACHE_TTL_S,
-        )
-        cacheNameRef.current = name
-        cachedContent = name
-        setCacheStatus({ kind: 'ready', name })
-      } catch {
-        /* stream inline systemInstruction */
-      }
-    }
-    return cachedContent
-  }
-
-  function scheduleBatchedReply() {
-    window.clearTimeout(debounceTimerRef.current)
-    const generation = ++debounceGenerationRef.current
-    setAwaitingCustomer(true)
-
-    debounceTimerRef.current = window.setTimeout(() => {
-      if (generation !== debounceGenerationRef.current) return
-      void runBatchedReply()
-    }, CUSTOMER_QUIET_MS)
-  }
-
-  function triggerReplyNow() {
-    window.clearTimeout(debounceTimerRef.current)
-    debounceGenerationRef.current += 1
-    setAwaitingCustomer(false)
-    void runBatchedReply()
-  }
-
-  function appendModelPlaceholder(streamId: string) {
-    setStreamingUserClientId(streamId)
-    commitMessages((prev) => {
-      const last = prev[prev.length - 1]
-      if (last?.role === 'model' && !last.text.trim()) return prev
-      return [...prev, { role: 'model', text: '', replyToClientId: streamId }]
-    })
-  }
-
-  function finalizeBatchedReply(text: string, usage?: UsageInfo, displayText?: string) {
-    commitMessages((prev) => {
-      for (let i = prev.length - 1; i >= 0; i--) {
-        const msg = prev[i]
-        if (msg.role === 'model' && !msg.text.trim()) {
-          const copy = [...prev]
-          copy[i] = {
-            role: 'model',
-            text,
-            usage,
-            replyToClientId: msg.replyToClientId,
-            displayText,
-          }
-          return copy
+        const res = await fetch('/api/facebook/send', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            pageId: selectedConversation.pageId,
+            recipientPsid: selectedConversation.customerPsid,
+            ...(text ? { text } : {}),
+            ...(imageUrl ? { imageDataUrl: imageUrl } : {}),
+          }),
+        })
+        const body = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string }
+        if (!res.ok || !body.ok) {
+          window.alert(body.error || `Gửi Messenger thất bại (${res.status}).`)
+          return
         }
+        setDraft('')
+        setPendingImage(null)
+        const inboxData = await fetchFacebookInboxData()
+        setPages(inboxData.pages)
+        setConversations(inboxData.conversations)
+      } finally {
+        setFacebookSendBusy(false)
       }
-      return [...prev, { role: 'model', text, usage, displayText }]
-    })
+      return
+    }
+
+    updateConversation(selectedConversation.id, (conversation) => ({
+      ...conversation,
+      status: 'human',
+      lastMessageAt: nowTime(),
+      messages: [
+        ...conversation.messages,
+        {
+          id: `staff-${Date.now()}`,
+          author: 'staff',
+          text,
+          time: nowTime(),
+          ...(imageUrl ? { imageUrl } : {}),
+        },
+      ],
+    }))
+    setDraft('')
+    setPendingImage(null)
   }
 
-  async function runBatchedReply() {
-    setAwaitingCustomer(false)
-    if (processingRef.current) return
-    if (!hasPendingCustomerMessages(messagesRef.current)) return
-
-    processingRef.current = true
-    setLoading(true)
-
-    const historyForApi = buildChatHistoryForApi(messagesRef.current)
-    const streamId = newClientId()
-    appendModelPlaceholder(streamId)
-    streamingRef.current?.reset()
-
-    const sysTok = ctxMetrics?.systemFull
-
-    try {
-      let retryCount = 0
-      for (;;) {
-        try {
-          streamingRef.current?.reset()
-          const cachedContent = await resolveCachedContentForSend()
-          const tSend = performance.now()
-          const result = isGemini
-            ? await streamGeminiReply(
-                apiKey,
-                model,
-                systemPrompt,
-                historyForApi,
-                (delta) => {
-                  streamingRef.current?.append(delta)
-                },
-                { maxOutputTokens, cachedContent },
-              )
-            : await streamOpenaiReply(
-                apiKey,
-                model,
-                systemPrompt,
-                historyForApi,
-                (delta) => {
-                  streamingRef.current?.append(delta)
-                },
-                { maxOutputTokens },
-              )
-
-          const tAfter = performance.now()
-          setLastPerf({
-            timing: result.timing,
-            msClientRoundTrip: tAfter - tSend,
-          })
-
-          const finalText =
-            result.text.trim() || streamingRef.current?.getText().trim() || result.text
-          const lastCustomerText = [...historyForApi]
-            .reverse()
-            .find((turn) => turn.role === 'user')?.text ?? ''
-          const imageExpanded = expandModelImageSampleMarkers(
-            finalText,
-            imageSampleGroups,
-            lastCustomerText,
-          )
-          finalizeBatchedReply(imageExpanded.apiText, result.usage, imageExpanded.displayText)
-
-          if (result.usage) {
-            const u = result.usage
-            const chatIn = sysTok != null ? Math.max(0, u.promptTokens - sysTok) : 0
-            setStats((s) => ({
-              totalPrompt: s.totalPrompt + u.promptTokens,
-              totalCached: s.totalCached + u.cachedTokens,
-              totalOutput: s.totalOutput + u.outputTokens,
-              totalChatInput: s.totalChatInput + (sysTok != null ? chatIn : 0),
-              calls: s.calls + 1,
-            }))
-          }
-          break
-        } catch {
-          retryCount += 1
-          const delayMs = Math.min(RETRY_BASE_MS * 2 ** (retryCount - 1), RETRY_MAX_MS)
-          await sleep(delayMs)
-        }
-      }
-    } finally {
-      processingRef.current = false
-      setLoading(false)
-      setStreamingUserClientId(null)
-      if (hasPendingCustomerMessages(messagesRef.current)) {
-        if (waitModeEnabled) scheduleBatchedReply()
-        else triggerReplyNow()
+  const onComposerImageChange = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file || !file.type.startsWith('image/')) return
+    const maxBytes = 4 * 1024 * 1024
+    if (file.size > maxBytes) {
+      window.alert('Ảnh quá lớn (tối đa 4MB).')
+      return
+    }
+    const reader = new FileReader()
+    reader.onload = () => {
+      if (typeof reader.result === 'string') {
+        setPendingImage({ dataUrl: reader.result, name: file.name })
       }
     }
+    reader.readAsDataURL(file)
   }
 
-  function send() {
-    const text = input.trim()
-    const images = pendingImages
-    if ((!text && !images.length) || (isGemini ? !geminiReady : !apiKey)) return
-
-    if (isGemini) {
-      window.clearTimeout(bgMetricsTimerRef.current)
-      metricsAbortRef.current?.abort()
-    }
-
-    const clientId = newClientId()
-    const userTurn: Msg = {
-      role: 'user',
-      text,
-      images: images.length ? images : undefined,
-      clientId,
-    }
-
-    commitMessages((prev) => [...prev, userTurn])
-    setInput('')
-    setPendingImages([])
-    setAttachError(null)
-    if (waitModeEnabled) scheduleBatchedReply()
-    else triggerReplyNow()
+  const onComposerKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key !== 'Enter' || e.shiftKey) return
+    if (e.nativeEvent.isComposing) return
+    e.preventDefault()
+    sendStaffMessage()
   }
-
-  function clearChat() {
-    window.clearTimeout(debounceTimerRef.current)
-    debounceGenerationRef.current += 1
-    processingRef.current = false
-    setAwaitingCustomer(false)
-    setStreamingUserClientId(null)
-    messagesRef.current = []
-    setMessages([])
-    setStats(EMPTY_STATS)
-    setLastPerf(null)
-    setPendingImages([])
-    setAttachError(null)
-    setLoading(false)
-  }
-
-  const missingKey = isGemini ? !geminiReady : !apiKey.trim()
-  const canSend = Boolean(input.trim() || pendingImages.length)
-  const usdVndRate = Number(import.meta.env.VITE_USD_VND) || 26_000
-
-  const sessionCost = useMemo(() => {
-    if (stats.calls === 0) return null
-    const tariff = getTariff(model)
-    const sys = ctxMetrics
-    if (!tariff) return { ok: false as const, reason: 'no-tariff' as const, model }
-    if (stats.totalPrompt <= 0)
-      return { ok: false as const, reason: 'no-metrics' as const, model }
-
-    const bill = estimateUsd(tariff, stats.totalPrompt, stats.totalCached, stats.totalOutput)
-    const p = stats.totalPrompt
-    const fileTokLuyKe = sys ? sys.file * stats.calls : 0
-    const usdMessages = sys ? (stats.totalChatInput / p) * bill.inputUsd : 0
-    const usdContextFile = sys ? (fileTokLuyKe / p) * bill.inputUsd : 0
-    const usdPrefix = Math.max(0, bill.inputUsd - usdMessages - usdContextFile)
-
-    return {
-      ok: true as const,
-      model,
-      tariffLabel: tariff.label,
-      hasContextBreakdown: Boolean(sys),
-      usdMessages,
-      usdContextFile,
-      usdPrefix,
-      usdOutput: bill.outputUsd,
-      usdTotal: bill.totalUsd,
-      inputUsd: bill.inputUsd,
-    }
-  }, [stats, model, ctxMetrics])
-
-  const fmtVnd = (usd: number) => Math.round(usd * usdVndRate).toLocaleString('vi-VN')
-  const fmtUsd = (usd: number) => usd.toFixed(6)
-
-  /** Hiển thị chi phí: VND chính, USD nhỏ trong ngoặc (giá API tính USD). */
-  function CostAmountCells({ usd, strong }: { usd: number; strong?: boolean }) {
-    const inner = (
-      <>
-        <span className="cost-vnd-main">{fmtVnd(usd)} đ</span>
-        <span className="cost-usd-sub"> ({fmtUsd(usd)} USD)</span>
-      </>
-    )
-    return (
-      <td className="cost-amount">
-        {strong ? <strong>{inner}</strong> : inner}
-      </td>
-    )
-  }
-
-  function CacheChip() {
-    if (!isGemini) return null
-    if (cacheStatus.kind === 'idle') return null
-    if (cacheStatus.kind === 'loading') {
-      return (
-        <span className="model-strip-meta" title="Đang tạo Context Cache cho systemInstruction">
-          · cache: đang tạo…
-        </span>
-      )
-    }
-    if (cacheStatus.kind === 'ready') {
-      return (
-        <span
-          className="model-strip-meta"
-          title={`Đang dùng Context Cache dùng chung (server): ${cacheStatus.name}. Mỗi tin chỉ gửi message mới, không gửi lại CONTEXT.md.`}
-        >
-          · cache: bật ✓
-        </span>
-      )
-    }
-    return (
-      <span
-        className="model-strip-meta"
-        title={`Cache fail (fallback gửi CONTEXT.md inline mỗi tin): ${cacheStatus.message}`}
-      >
-        · cache: tắt (fallback inline)
-      </span>
-    )
-  }
-
-  const displayTitle = title?.trim() || 'Salon — chat AI'
-  const initials =
-    displayTitle
-      .replace(/[—–-]/g, ' ')
-      .split(/\s+/)
-      .map((part) => part.trim())
-      .filter(Boolean)
-      .slice(0, 2)
-      .map((part) => part[0]?.toUpperCase() ?? '')
-      .join('') || 'AI'
-
-  const headerStatus = missingKey
-    ? { className: 'status-dot warn', label: 'Thiếu API key' }
-    : loading
-      ? { className: 'status-dot', label: 'Đang phản hồi' }
-      : awaitingCustomer
-        ? { className: 'status-dot warn', label: 'Chờ 15 giây' }
-        : { className: 'status-dot', label: 'Sẵn sàng' }
 
   return (
-    <div className="app">
-      <header className="header">
-        <div className="header-logo" aria-hidden="true">
-          {initials}
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-mark">TKW</div>
+          <div>
+            <h1>Salon AI Inbox</h1>
+            <p>Fanpage messages + knowledge training</p>
+          </div>
         </div>
-        <div className="header-body">
-          <h1>{displayTitle}</h1>
-          <p className="header-sub">
-            <span className={headerStatus.className}>{headerStatus.label}</span>
-            <span>
-              Provider <code>{isGemini ? 'gemini' : 'openai'}</code>
-            </span>
-            <span>
-              · model <code>{model}</code>
-            </span>
-            <span>
-              · ngữ cảnh <code>CONTEXT.md</code>
-            </span>
-          </p>
-        </div>
-      </header>
 
-      {missingKey && (
-        <div className="banner error">
-          {isGemini ? (
-            geminiProxyInjectsKey ? (
-              <>
-                Server chưa cấu hình <code>GEMINI_API_KEY</code> (proxy Gemini). Kiểm tra file env trên máy chủ và
-                khởi động lại dịch vụ.
-              </>
-            ) : (
-              <>
-                Thiếu <code>VITE_GEMINI_API_KEY</code>. Sao chép <code>.env.example</code> thành <code>.env</code> và
-                dán API key từ Google AI Studio.
-              </>
-            )
-          ) : (
-            <>
-              Thiếu <code>VITE_OPENAI_API_KEY</code>. Sao chép <code>.env.example</code> thành <code>.env</code> và dán
-              API key từ OpenAI.
-            </>
-          )}
-        </div>
-      )}
-
-      {contextBanner && (
-        <div
-          className={`banner ${
-            contextBanner.level === 'error'
-              ? 'error'
-              : contextBanner.level === 'ok'
-                ? 'ok'
-                : 'warn'
-          }`}
-        >
-          {contextBanner.message}
-        </div>
-      )}
-
-      <div className="model-strip">
-        Model: <code>{model}</code>
-        <span className="model-strip-meta">
-          · stream · max out {maxOutputTokens} tok
-          {isGemini && /gemini-3|\/3\./i.test(model) ? ' · thinking off (3.x)' : ''}
-        </span>
-        <CacheChip />
-      </div>
-
-      <div className="toolbar">
-        <label className="branch-picker">
-          <span>Fanpage</span>
-          <select
-            value={selectedBranchId}
-            onChange={(e) => setSelectedBranchId(Number(e.target.value))}
+        <nav className="tabs" aria-label="Khu vực làm việc">
+          <button
+            type="button"
+            className={activeTab === 'inbox' ? 'tab active' : 'tab'}
+            onClick={() => setActiveTab('inbox')}
           >
-            {BRANCH_PAGES.map((branch) => (
-              <option key={branch.id} value={branch.id}>
-                {branch.name}
-              </option>
-            ))}
-          </select>
-        </label>
-        {contextFromServer && (
-          <button type="button" onClick={() => setContextEditorOpen(true)}>
-            Sửa CONTEXT (server)
+            Inbox
           </button>
-        )}
-        <button type="button" className="secondary" onClick={() => void loadContext()}>
-          Tải lại CONTEXT
-        </button>
-        <button type="button" className="secondary" onClick={clearChat}>
-          Xóa hội thoại
-        </button>
-        <button
-          type="button"
-          className="secondary"
-          onClick={() => {
-            window.clearTimeout(debounceTimerRef.current)
-            debounceGenerationRef.current += 1
-            setAwaitingCustomer(false)
-            setWaitModeEnabled((v) => !v)
-          }}
-        >
-          Chờ 15s: {waitModeEnabled ? 'Bật' : 'Tắt'}
-        </button>
-        <span className="context-hint">
-          {contextFromServer
-            ? 'Ngữ cảnh lưu trên server (data/CONTEXT.md). Lưu xong cache Gemini được làm mới.'
-            : 'Chạy server API hoặc sửa public/CONTEXT.md rồi bấm tải lại.'}
-        </span>
-      </div>
-
-      <ContextEditor
-        open={contextEditorOpen}
-        initialContent={contextMd}
-        requiresEditToken={contextRequiresEditToken}
-        onClose={() => setContextEditorOpen(false)}
-        onSaved={(doc) => {
-          setContextMd(doc.content)
-          setContextRequiresEditToken(doc.requiresEditToken)
-          setContextBanner({
-            level: 'ok',
-            message: `Đã lưu CONTEXT trên server (${new Date(doc.updatedAt).toLocaleString('vi-VN')}).`,
-          })
-        }}
-      />
-
-      {lastPerf && (
-        <div className="timing-strip">
-          <div className="timing-strip-title">Đo thời gian (tin gửi cuối)</div>
-          <div className="timing-breakdown">
-            <span className="timing-chip timing-chip-total" title="Bấm Gửi → stream xong">
-              <strong>Tổng</strong> {fmtMs(lastPerf.msClientRoundTrip)}
-            </span>
-            <span className="timing-chip" title="fetch → có HTTP response (mạng + TLS + Google nhận request)">
-              HTTP {fmtMs(lastPerf.timing.msToResponseHeaders)}
-            </span>
-            <span
-              className="timing-chip timing-chip-warn"
-              title="Từ có response đến ký tự đầu — thường là bottleneck (model / xếp hàng)"
-            >
-              Chờ chữ đầu {fmtMs(lastPerf.timing.msAfterHeadersToFirstToken)}
-            </span>
-            <span className="timing-chip" title="Chữ đầu → hết stream (model sinh tiếp + chunk)">
-              Stream {fmtMs(lastPerf.timing.msStreamGeneration)}
-            </span>
-            <span className="timing-chip timing-chip-muted" title="Chỉ phần fetch stream → đọc hết SSE">
-              API {fmtMs(lastPerf.timing.msWallClockFetch)}
-            </span>
-          </div>
-          <p className="timing-note timing-note-inline">
-            Đo <code>performance.now()</code> trên trình duyệt. Nếu <strong>Chờ chữ đầu</strong> chiếm gần hết
-            tổng → thường do nhà cung cấp API / mạng hoặc prompt lớn, không phải React.
-          </p>
-        </div>
-      )}
-
-      <div className="chat" aria-busy={loading}>
-        {messages.length === 0 && (
-          <div className="empty">
-            <div className="empty-icon" aria-hidden="true">
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                viewBox="0 0 24 24"
-                width="28"
-                height="28"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.8"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <path d="M21 12a8 8 0 0 1-11.8 7l-4.7 1 1-4.7A8 8 0 1 1 21 12z" />
-              </svg>
-            </div>
-            <p className="empty-title">
-              {missingKey ? 'Cần thêm API key để bắt đầu' : 'Sẵn sàng tư vấn khách salon'}
-            </p>
-            <p className="empty-sub">
-              {missingKey
-                ? 'Dán API key vào file .env rồi khởi động lại Vite.'
-                : 'Nhập tin nhắn hoặc đính kèm ảnh/video — AI trả lời từng câu, có gửi ảnh mẫu nếu phù hợp.'}
-            </p>
-          </div>
-        )}
-        {messages.flatMap((m, i) => {
-          const isErr = m.role === 'model' && m.text.startsWith('[Lỗi API]')
-          const isStreamingBubble =
-            loading &&
-            m.role === 'model' &&
-            !m.text.trim() &&
-            !isErr &&
-            m.replyToClientId === streamingUserClientId
-
-          if (m.role === 'model' && !m.text.trim() && !isStreamingBubble && !isErr) {
-            return []
-          }
-
-          if (m.role === 'user' || isErr) {
-            return [
-              <div
-                key={`${m.role}-${i}`}
-                className={`msg ${m.role} ${isErr ? 'err' : ''}`}
-              >
-                <div className="role">
-                  {m.role === 'user' ? 'Khách / Bạn' : 'AI'}
-                  {m.usage && (
-                    <UsageLine
-                      u={m.usage}
-                      metrics={ctxMetrics}
-                      contextMetricsApprox={!isGemini}
-                    />
-                  )}
-                </div>
-                {m.images?.length ? <MessageImages images={m.images} /> : null}
-                {m.text}
-              </div>,
-            ]
-          }
-
-          if (isStreamingBubble) {
-            // Render component cô lập — App KHÔNG re-render mỗi delta.
-            return [
-              <StreamingBubble
-                key={`model-stream-${m.replyToClientId ?? i}`}
-                ref={streamingRef}
-              />,
-            ]
-          }
-
-          return [
-            <ModelMessageBubbles
-              key={`model-${i}`}
-              messageKey={`model-${i}`}
-              text={m.displayText ?? m.text}
-              usageLine={
-                m.usage ? (
-                  <UsageLine
-                    u={m.usage}
-                    metrics={ctxMetrics}
-                    contextMetricsApprox={!isGemini}
-                  />
-                ) : null
-              }
-            />,
-          ]
-        })}
-        <div ref={chatEndRef} />
-      </div>
-
-      <div className="composer">
-        <input
-          ref={imageInputRef}
-          type="file"
-          accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/webm,video/quicktime"
-          multiple
-          hidden
-          onChange={(e) => void onPickImages(e)}
-        />
-        <button
-          type="button"
-          className="secondary attach"
-          disabled={missingKey || pendingImages.length >= MAX_CHAT_IMAGES}
-          onClick={() => imageInputRef.current?.click()}
-          aria-label="Đính kèm ảnh hoặc video"
-          title="Đính kèm ảnh hoặc video"
-        >
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            viewBox="0 0 24 24"
-            width="20"
-            height="20"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.8"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden="true"
+          <button
+            type="button"
+            className={activeTab === 'training' ? 'tab active' : 'tab'}
+            onClick={() => setActiveTab('training')}
           >
-            <rect x="3" y="4" width="18" height="16" rx="2.5" />
-            <circle cx="8.5" cy="10" r="1.5" />
-            <path d="M21 16l-5-5-9 9" />
-          </svg>
-        </button>
-        <textarea
-          rows={2}
-          placeholder="Nhập tin nhắn hoặc đính kèm ảnh/video (tóc, màu, kiểu mẫu)…  ⏎ để gửi · Shift+⏎ xuống dòng"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault()
-              void send()
-            }
-          }}
-          disabled={missingKey}
-        />
-        <button
-          type="button"
-          className="send"
-          disabled={missingKey || !canSend}
-          onClick={() => send()}
-        >
-          <span>{loading ? 'Đang trả lời…' : awaitingCustomer ? 'Chờ 15s…' : 'Gửi'}</span>
-          {!loading && !awaitingCustomer && (
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              viewBox="0 0 24 24"
-              width="16"
-              height="16"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden="true"
-            >
-              <path d="M5 12h14" />
-              <path d="m13 6 6 6-6 6" />
-            </svg>
-          )}
-        </button>
-      </div>
-      {waitModeEnabled && awaitingCustomer && !loading && (
-        <p className="composer-hint">Khách im 15 giây thì AI đọc toàn bộ tin và trả lời một lần.</p>
-      )}
-      {attachError && <p className="attach-error">{attachError}</p>}
-      {pendingImages.length > 0 && (
-        <div className="pending-images">
-          {pendingImages.map((image, idx) => (
-            <div key={`pending-${idx}`} className="pending-image">
-              {image.mimeType.startsWith('video/') ? (
-                <video src={image.dataUrl} controls playsInline preload="metadata">
-                  Video đính kèm {idx + 1}
-                </video>
-              ) : (
-                <img src={image.dataUrl} alt={`Ảnh đính kèm ${idx + 1}`} />
-              )}
-              <button
-                type="button"
-                className="secondary pending-image-remove"
-                onClick={() => removePendingImage(idx)}
-                aria-label={`Xóa file ${idx + 1}`}
-              >
-                ×
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
+            Training
+          </button>
+        </nav>
 
-      {stats.calls > 0 && (
-        <details className="cost-details">
-          <summary className="cost-summary">
-            Chi phí (ước tính){' '}
-            {sessionCost?.ok && (
-              <span className="cost-summary-total">
-                · tổng ~{fmtVnd(sessionCost.usdTotal)} đ
-                <span className="cost-usd-sub"> (~{fmtUsd(sessionCost.usdTotal)} USD)</span>
-              </span>
-            )}
-          </summary>
-          <div className="cost-panel">
-            {sessionCost?.ok ? (
-              <>
-                <p className="cost-model">
-                  {sessionCost.tariffLabel} · <code>{sessionCost.model}</code>
-                </p>
-                <table className="cost-simple">
-                  <tbody>
-                    {sessionCost.hasContextBreakdown ? (
-                      <>
-                        <tr>
-                          <td>
-                            1) Input <strong>tin nhắn</strong> (hội thoại, không gồm nội dung{' '}
-                            <code>CONTEXT.md</code>)
-                          </td>
-                          <CostAmountCells usd={sessionCost.usdMessages} />
-                        </tr>
-                        <tr>
-                          <td>
-                            2) Input <strong>tổng CONTEXT.md</strong> (ước{' '}
-                            <code>
-                              {((ctxMetrics?.file ?? 0) * stats.calls).toLocaleString('vi-VN')}
-                            </code>{' '}
-                            tok file × {stats.calls} lần gọi)
-                          </td>
-                          <CostAmountCells usd={sessionCost.usdContextFile} />
-                        </tr>
-                      </>
-                    ) : (
-                      <tr>
-                        <td>
-                          1) Input <strong>tổng</strong> (Google usage, chưa tách hội thoại /{' '}
-                          <code>CONTEXT.md</code>)
-                        </td>
-                        <CostAmountCells usd={sessionCost.inputUsd} />
-                      </tr>
-                    )}
-                    <tr>
-                      <td>{sessionCost.hasContextBreakdown ? '3' : '2'}) Output (trả lời model)</td>
-                      <CostAmountCells usd={sessionCost.usdOutput} />
-                    </tr>
-                    <tr className="cost-total">
-                      <td>
-                        <strong>{sessionCost.hasContextBreakdown ? '4' : '3'}) Tổng cuộc hội thoại (API)</strong>
-                      </td>
-                      <CostAmountCells usd={sessionCost.usdTotal} strong />
-                    </tr>
-                  </tbody>
-                </table>
-                <p className="cost-how">
-                  <strong>Cách tính:</strong>{' '}
-                  {isGemini ? (
-                    <>
-                      Google trả <code>promptTokenCount</code> + <code>cachedContentTokenCount</code> + output. Tiền{' '}
-                      <strong>input</strong> = (token chưa cache × giá input) + (token cache × giá đọc cache) theo{' '}
-                      <code>src/lib/gemini-pricing.ts</code> (
-                      <a href="https://ai.google.dev/gemini-api/docs/pricing" target="_blank" rel="noreferrer">
-                        bảng giá Gemini
-                      </a>
-                      ). (1)(2) chia theo <code>countTokens</code> cho CONTEXT vs hội thoại; chưa gồm tiền tố salon (~
-                      {fmtVnd(sessionCost.usdPrefix)} đ).
-                    </>
-                  ) : (
-                    <>
-                      OpenAI trả <code>usage</code> (prompt / completion). Ước chi phí theo{' '}
-                      <code>src/lib/gemini-pricing.ts</code> (
-                      <a href="https://openai.com/api/pricing" target="_blank" rel="noreferrer">
-                        bảng giá OpenAI
-                      </a>
-                      ). (1)(2) <em>chia ước</em> CONTEXT / hội thoại (CONTEXT ước chars/4).
-                    </>
-                  )}{' '}
-                  (4) = input + output. <code>VITE_USD_VND</code> = {usdVndRate.toLocaleString('vi-VN')} đ/USD.
-                </p>
-              </>
-            ) : sessionCost?.reason === 'no-tariff' ? (
-              <p className="cost-how">
-                Chưa có giá cho <code>{model}</code> — thêm vào{' '}
-                <code>src/lib/gemini-pricing.ts</code>.
-              </p>
-            ) : (
-              <p className="cost-how">
-                Chưa đếm xong token CONTEXT — mở lại sau hoặc bấm Tải lại CONTEXT.md (không ảnh hưởng
-                chat).
-              </p>
-            )}
+        <div className="metric-stack">
+          <div className="metric">
+            <span>Tin chưa đọc</span>
+            <strong>{totalUnread}</strong>
           </div>
-        </details>
-      )}
+          <div className="metric">
+            <span>AI đang bật</span>
+            <strong>{aiActive}</strong>
+          </div>
+          <div className="metric">
+            <span>Cần nhân viên</span>
+            <strong>{needsHuman}</strong>
+          </div>
+        </div>
+
+        <div className="sync-card">
+          <div className={`sync-dot ${syncState}`} />
+          <div>
+            <strong>{syncCardTitle(syncState)}</strong>
+            <p>{syncMessage}</p>
+          </div>
+        </div>
+      </aside>
+
+      <main className="workspace">
+        {activeTab === 'inbox' ? (
+          <>
+            <section className="topbar">
+              <div>
+                <p className="eyebrow">Quản lý fanpage</p>
+              </div>
+              <div className="topbar-actions">
+                <button type="button" className="ghost-button" onClick={() => void handleSync()}>
+                  {syncState === 'syncing' ? 'Đang đồng bộ...' : 'Đồng bộ Facebook'}
+                </button>
+              </div>
+            </section>
+
+            {facebookConversationError && <div className="notice error">{facebookConversationError}</div>}
+
+            <section className="inbox-layout">
+              <div className="page-panel">
+                <label className="field-label" htmlFor="page-filter">
+                  Fanpage
+                </label>
+                <select
+                  id="page-filter"
+                  value={selectedPageId}
+                  onChange={(e) => {
+                    const nextPageId = e.target.value
+                    setSelectedPageId(nextPageId)
+                    const nextConversation =
+                      nextPageId === 'all'
+                        ? conversations[0]
+                        : conversations.find((item) => item.pageId === nextPageId)
+                    if (nextConversation) setSelectedConversationId(nextConversation.id)
+                  }}
+                >
+                  <option value="all">Tất cả fanpage</option>
+                  {pages.map((page) => (
+                    <option key={page.id} value={page.id}>
+                      {page.name}
+                    </option>
+                  ))}
+                </select>
+
+                <div className="page-list">
+                  {pages.map((page) => (
+                    <div
+                      key={page.id}
+                      className={selectedPageId === page.id ? 'page-row active' : 'page-row'}
+                    >
+                      <button
+                        type="button"
+                        className="page-row-main"
+                        onClick={() => {
+                          setSelectedPageId(page.id)
+                          const next = conversations.find((item) => item.pageId === page.id)
+                          if (next) setSelectedConversationId(next.id)
+                        }}
+                      >
+                        <PageAvatar page={page} />
+                        <span>
+                          <strong>{page.name}</strong>
+                          <small>{page.connected ? 'Đã kết nối' : 'Chưa kết nối fanpage'}</small>
+                        </span>
+                        {page.unread > 0 && <b>{page.unread}</b>}
+                      </button>
+                      <button
+                        type="button"
+                        className="page-row-settings"
+                        aria-label={`Cài đặt ${page.name}`}
+                        title="Cài đặt fanpage"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          setPageSettingsPageId(page.id)
+                        }}
+                      >
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden>
+                          <circle cx="12" cy="12" r="3" stroke="currentColor" strokeWidth="1.7" />
+                          <path
+                            d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M16.34 6.66l1.41-1.41"
+                            stroke="currentColor"
+                            strokeWidth="1.7"
+                            strokeLinecap="round"
+                          />
+                        </svg>
+                      </button>
+                    </div>
+                  ))}
+                </div>
+
+                {!pages.length && (
+                  <div className="empty-panel">
+                    <strong>Chưa có fanpage thật</strong>
+                    <span>Bấm nút Đồng bộ Facebook ở thanh trên để tải danh sách fanpage.</span>
+                  </div>
+                )}
+              </div>
+
+              <div className="conversation-list" aria-label="Danh sách hội thoại">
+                {!filteredConversations.length && (
+                  <div className="empty-panel">
+                    <strong>Chưa có hội thoại thật</strong>
+                    <span>Nhắn thử vào fanpage — tin mới sẽ hiện ở đây.</span>
+                  </div>
+                )}
+                {filteredConversations.map((conversation) => (
+                  <button
+                    type="button"
+                    key={conversation.id}
+                    className={
+                      conversation.id === selectedConversation?.id
+                        ? 'conversation-row active'
+                        : 'conversation-row'
+                    }
+                    onClick={() => setSelectedConversationId(conversation.id)}
+                  >
+                    <Avatar conversation={conversation} />
+                    <span className="conversation-main">
+                      <span className="conversation-head">
+                        <strong>{conversation.customer}</strong>
+                        <time>{conversation.lastMessageAt}</time>
+                      </span>
+                      <span className="conversation-title">{conversation.title}</span>
+                      <span className="conversation-ai-cost">
+                        Chi phí AI (ước tính): {formatInboxAiCostVnd(conversation.aiEstimatedTotalUsd)}
+                      </span>
+                      <span className="tag-line">
+                        {conversation.tags.slice(0, 2).map((tag) => (
+                          <em key={tag}>{tag}</em>
+                        ))}
+                      </span>
+                      {conversation.sourceAd?.adId && (
+                        <span className="ad-source-mini">Ad {conversation.sourceAd.adId}</span>
+                      )}
+                    </span>
+                    <span className={`status-pill ${conversation.status}`}>
+                      {STATUS_LABEL[conversation.status]}
+                    </span>
+                  </button>
+                ))}
+              </div>
+
+              {selectedConversation && (
+                <section className="chat-panel">
+                  <header className="chat-head">
+                    <div className="customer-title">
+                      <Avatar conversation={selectedConversation} large />
+                      <div>
+                        <h3>{selectedConversation.customer}</h3>
+                        <p className="chat-head-sub">{selectedPage?.name ?? 'Fanpage'}</p>
+                        <p className="chat-head-cost">
+                          Chi phí AI (ước tính) hội thoại này:{' '}
+                          <strong>{formatInboxAiCostVnd(selectedConversation.aiEstimatedTotalUsd)}</strong>
+                        </p>
+                      </div>
+                    </div>
+
+                    <label className="ai-switch">
+                      <span>
+                        <strong>AI trả lời</strong>
+                        <small>
+                          {selectedConversation.aiEnabled ? 'Tự động phản hồi tin mới' : 'Tạm dừng cho hội thoại này'}
+                          {selectedPage?.aiMasterEnabled === false
+                            ? ' · Fanpage đang tắt AI toàn page (bật trong ⚙ fanpage để chạy).'
+                            : ''}
+                        </small>
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={selectedConversation.aiEnabled}
+                        onChange={() => toggleAi(selectedConversation.id)}
+                      />
+                      <i aria-hidden="true" />
+                    </label>
+                  </header>
+
+                  <div className="message-feed" ref={messageFeedRef}>
+                    <div className="conversation-intel">
+                      <div>
+                        <span>Nguồn quảng cáo</span>
+                        {(() => {
+                          const ad = selectedConversation.sourceAd as MessageReferral | undefined
+                          const thumb = creativePreviewUrl(ad)
+                          if (thumb) {
+                            const proxied = metaHostedMediaSrc(thumb)
+                            return (
+                              <img
+                                className="intel-ad-thumb"
+                                src={proxied}
+                                alt=""
+                                loading="lazy"
+                                referrerPolicy="no-referrer"
+                                onError={(ev) => {
+                                  const el = ev.currentTarget
+                                  if (el.dataset.fallback === '1') return
+                                  el.dataset.fallback = '1'
+                                  el.src = thumb
+                                }}
+                              />
+                            )
+                          }
+                          if (ad?.videoUrl)
+                            return (
+                              <video
+                                className="intel-ad-thumb intel-ad-video"
+                                src={metaHostedMediaSrc(ad.videoUrl)}
+                                controls
+                                playsInline
+                                preload="metadata"
+                              />
+                            )
+                          return null
+                        })()}
+                        <strong>
+                          {selectedConversation.sourceAd?.title ||
+                            selectedConversation.sourceAd?.adId ||
+                            'Chưa có referral quảng cáo'}
+                        </strong>
+                        {selectedConversation.sourceAd?.adId && (
+                          <small>Ad ID: {selectedConversation.sourceAd.adId}</small>
+                        )}
+                        {selectedConversation.sourceAd?.ref && (
+                          <small>Ref: {selectedConversation.sourceAd.ref}</small>
+                        )}
+                      </div>
+                      <div>
+                        <span>Trạng thái Messenger</span>
+                        <strong>Đọc / giao tin</strong>
+                        <small>
+                          Khách đọc: {formatDateTime(selectedConversation.customerReadAt)} · Giao tin:{' '}
+                          {formatDateTime(selectedConversation.pageDeliveredAt)}
+                        </small>
+                      </div>
+                    </div>
+                    {selectedConversation.messages.map((message) => {
+                      const referralBlock =
+                        Boolean(message.referral) &&
+                        Boolean(
+                          message.referral!.adId ||
+                            message.referral!.title ||
+                            message.referral!.photoUrl ||
+                            message.referral!.videoUrl ||
+                            message.referral!.ref ||
+                            message.referral!.source,
+                        )
+                      const hasGallery =
+                        (message.imageUrls?.length ?? 0) > 0 ||
+                        (message.videoUrls?.length ?? 0) > 0 ||
+                        (message.audioUrls?.length ?? 0) > 0
+                      const hasStaffImg = Boolean(message.imageUrl)
+                      const hasText =
+                        Boolean(message.text.trim()) && !isPlaceholderInboxText(message.text)
+                      const hasAny = referralBlock || hasGallery || hasStaffImg || hasText
+
+                      return (
+                      <article key={message.id} className={`bubble ${message.author}`}>
+                        <span className="bubble-meta">
+                          {message.author === 'customer'
+                            ? selectedConversation.customer
+                            : message.author === 'ai'
+                              ? 'AI'
+                              : 'Nhân viên'}
+                          {' · '}
+                          {message.time}
+                        </span>
+                        {referralBlock ? (
+                          <div className="bubble-ad-card">
+                            {message.referral!.title ? (
+                              <strong className="bubble-ad-title">{message.referral!.title}</strong>
+                            ) : null}
+                            <AdCreativeMedia referral={message.referral!} />
+                            <div className="bubble-ad-meta">
+                              {message.referral!.source ? <span>{message.referral!.source}</span> : null}
+                              {message.referral!.type ? <span>{message.referral!.type}</span> : null}
+                              {message.referral!.adId ? <span>Ad ID: {message.referral!.adId}</span> : null}
+                              {message.referral!.ref ? <span>Ref: {message.referral!.ref}</span> : null}
+                              {message.referral!.sourceUrl ? (
+                                <a
+                                  className="bubble-ad-link"
+                                  href={message.referral!.sourceUrl}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                >
+                                  Mở liên kết
+                                </a>
+                              ) : null}
+                            </div>
+                          </div>
+                        ) : null}
+                        <MessageMediaGallery
+                          imageUrls={message.imageUrls}
+                          videoUrls={message.videoUrls}
+                          audioUrls={message.audioUrls}
+                        />
+                        {message.imageUrl ? (
+                          <img
+                            className="bubble-image"
+                            src={message.imageUrl}
+                            alt=""
+                            referrerPolicy="no-referrer"
+                          />
+                        ) : null}
+                        {hasText ? <p>{message.text}</p> : null}
+                        {!hasAny ? (
+                          <p className="bubble-empty-hint">
+                            Tin này không có nội dung hiển thị được (ví dụ chỉ sticker hoặc loại file chưa hỗ trợ).
+                          </p>
+                        ) : null}
+                      </article>
+                      )
+                    })}
+                  </div>
+
+                  <footer className="composer">
+                    <input
+                      ref={composerFileRef}
+                      type="file"
+                      accept="image/*"
+                      className="composer-file-input"
+                      onChange={onComposerImageChange}
+                    />
+                    {pendingImage ? (
+                      <div className="composer-preview">
+                        <img src={pendingImage.dataUrl} alt={pendingImage.name} />
+                        <button
+                          type="button"
+                          className="composer-preview-remove"
+                          aria-label="Bỏ ảnh"
+                          onClick={() => setPendingImage(null)}
+                        >
+                          ×
+                        </button>
+                      </div>
+                    ) : null}
+                    <div className="composer-pill">
+                      <button
+                        type="button"
+                        className="composer-pill-add"
+                        aria-label="Thêm ảnh"
+                        title="Thêm ảnh"
+                        onClick={() => composerFileRef.current?.click()}
+                      >
+                        <span aria-hidden>+</span>
+                      </button>
+                      <textarea
+                        className="composer-pill-input"
+                        value={draft}
+                        onChange={(e) => setDraft(e.target.value)}
+                        onKeyDown={onComposerKeyDown}
+                        placeholder="Nhập phản hồi…"
+                        rows={1}
+                      />
+                      <button
+                        type="button"
+                        className="composer-pill-send"
+                        disabled={(!draft.trim() && !pendingImage) || facebookSendBusy}
+                        aria-label="Gửi"
+                        title="Gửi"
+                        onClick={sendStaffMessage}
+                      >
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden>
+                          <path
+                            d="M12 19V5M12 5l-6 6M12 5l6 6"
+                            stroke="currentColor"
+                            strokeWidth="2.2"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          />
+                        </svg>
+                      </button>
+                    </div>
+                  </footer>
+                </section>
+              )}
+            </section>
+
+            {pageSettingsPageId ? (
+              <div
+                className="page-settings-overlay"
+                role="presentation"
+                onClick={() => setPageSettingsPageId(null)}
+              >
+                <div
+                  className="page-settings-dialog"
+                  role="dialog"
+                  aria-modal="true"
+                  aria-labelledby="page-settings-title"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <h2 id="page-settings-title">
+                    Cài đặt · {pages.find((p) => p.id === pageSettingsPageId)?.name ?? 'Fanpage'}
+                  </h2>
+                  <label className="page-settings-label" htmlFor="page-modal-branch">
+                    Ngữ cảnh chi nhánh (mặc định cho fanpage)
+                  </label>
+                  <select
+                    id="page-modal-branch"
+                    className="chat-branch-select"
+                    value={pageModalBranch}
+                    onChange={(e) => setPageModalBranch(e.target.value)}
+                  >
+                    <option value="">Tự động (theo tên fanpage)</option>
+                    {BRANCH_PAGES.map((b) => (
+                      <option key={b.id} value={String(b.id)}>
+                        {b.name}
+                      </option>
+                    ))}
+                  </select>
+                  <label className="page-settings-toggle-row">
+                    <span>
+                      <strong>AI tự trả lời toàn fanpage</strong>
+                      <small>
+                        Khi tắt: không hội thoại nào nhận AI tự động. Bật lại để chạy theo từng hội thoại (nút AI
+                        trong chat).
+                      </small>
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={pageModalMasterAi}
+                      onChange={(e) => setPageModalMasterAi(e.target.checked)}
+                    />
+                  </label>
+                  <p className="page-settings-cost">
+                    Tổng chi phí AI (ước tính) trên fanpage:{' '}
+                    <strong>{formatInboxAiCostVnd(pageSettingsTotalUsd)}</strong>
+                  </p>
+                  <div className="page-settings-actions">
+                    <button type="button" className="ghost-button" onClick={() => setPageSettingsPageId(null)}>
+                      Đóng
+                    </button>
+                    <button type="button" className="primary-button" onClick={savePageSettingsModal}>
+                      Lưu
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ) : null}
+          </>
+        ) : (
+          <TrainingChat title="Training & cập nhật kiến thức" />
+        )}
+      </main>
+
     </div>
   )
 }
+
+export default App
+
+
+
+
+
+
+

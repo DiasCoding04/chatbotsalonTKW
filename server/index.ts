@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage } from 'node:http'
+import { createServer } from 'node:http'
 import { contextEditTokenRequired, verifyContextEditToken } from './context-auth.ts'
 import {
   clearSharedContextCacheStore,
@@ -18,6 +18,7 @@ import { applySecurityHeaders } from './security-headers.ts'
 import { canServeStaticBuild, tryServeStatic } from './static.ts'
 import { tryProxyUpstream } from './upstream-proxy.ts'
 import { useVertexGeminiBackend } from './vertex-auth.ts'
+import { handleFacebookApi } from './facebook.ts'
 
 loadEnvFile()
 assertProductionEnv()
@@ -46,7 +47,8 @@ function contextApiPayload(doc: { content: string; updatedAt: string }) {
 
 const server = createServer((req, res) => {
   void (async () => {
-    const url = req.url?.split('?')[0] ?? ''
+    const requestUrl = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
+    const url = requestUrl.pathname
 
     if (req.method === 'GET' && url === '/api/health') {
       sendJson(res, 200, {
@@ -97,6 +99,8 @@ const server = createServer((req, res) => {
       })
       return
     }
+
+    if (await handleFacebookApi(req, res, requestUrl)) return
 
     if (req.method === 'POST' && url === '/api/context-cache/ensure') {
       const apiKey = getServerGeminiApiKey()
