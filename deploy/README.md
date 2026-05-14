@@ -14,6 +14,21 @@ npm run pack:release
 
 File upload: `release/salon-chat-gemini.tgz`
 
+## Vertex AI
+
+If you use Vertex AI, set these environment variables in production:
+
+- `GEMINI_BACKEND=vertex`
+- `VERTEX_AI_PROJECT_ID=<your-project-id>`
+- `GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json`
+  or
+- `VERTEX_SERVICE_ACCOUNT_JSON=<service-account-json>`
+
+Also keep:
+- `NODE_ENV=production`
+- `APP_PUBLIC_URL=https://chatbot.salontukawa.com`
+- `CONTEXT_EDITOR_TOKEN=<secret>`
+
 ## 2. DNS
 
 Trỏ `A` `chatbot.salontukawa.com` → IP VPS.
