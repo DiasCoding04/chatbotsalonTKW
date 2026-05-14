@@ -23,6 +23,7 @@ COPY --from=builder /usr/src/app/public ./public
 COPY --from=builder /usr/src/app/.env.example ./.env.example
 
 ENV NODE_ENV=production
+ENV APP_PUBLIC_URL=https://chatbot.salontukawa.com
 ENV CONTEXT_CACHE_SERVER_PORT=8080
 EXPOSE 8080
 

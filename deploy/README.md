@@ -6,6 +6,7 @@
 cd C:\Users\pc\Downloads\salon-chat-gemini
 Copy-Item .env.production.example .env.production -Force
 # Sửa .env.production: dán VITE_GEMINI_API_KEY, giữ VITE_GEMINI_PROXY_INJECTS_KEY=false
+# Đặt APP_PUBLIC_URL=https://chatbot.salontukawa.com
 npm ci
 npm run build:prod
 npm run pack:release
