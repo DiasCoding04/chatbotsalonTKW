@@ -23,7 +23,10 @@ import { handleFacebookApi } from './facebook.ts'
 loadEnvFile()
 assertProductionEnv()
 
-const PORT = Number(process.env.CONTEXT_CACHE_SERVER_PORT) || 8787
+const PORT =
+  Number(process.env.CONTEXT_CACHE_SERVER_PORT) ||
+  Number(process.env.PORT) ||
+  8787
 const HOST = process.env.CONTEXT_CACHE_SERVER_HOST?.trim() || '0.0.0.0'
 const DEFAULT_TTL_S = Number(process.env.GEMINI_CONTEXT_CACHE_TTL_S) || 3600
 const DEFAULT_MODEL = process.env.VITE_GEMINI_MODEL?.trim() || 'gemini-3.1-flash-lite'
