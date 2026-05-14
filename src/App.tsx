@@ -75,6 +75,8 @@ type Conversation = {
   aiEstimatedTotalUsd?: number
   aiLastContextCacheHit?: boolean
   aiLastRunAt?: string
+  /** Mốc sort theo `lastMessageAt` gốc (server); dùng khi xem “Tất cả fanpage”. */
+  lastMessageSortTs?: number
 }
 
 type FacebookStatus = {
@@ -154,6 +156,9 @@ const STATUS_LABEL: Record<ConversationStatus, string> = {
   human: 'Nhân viên',
   closed: 'Đã xong',
 }
+
+/** Chế độ inbox: gộp hội thoại của mọi fanpage (không trùng id page Facebook thật). */
+const ALL_FANPAGES_ID = '__all_fanpages__'
 
 function nowTime() {
   return new Date().toLocaleTimeString('vi-VN', {
@@ -498,6 +503,7 @@ function MessageMediaGallery({
 function mapStoredConversation(item: FacebookStoreConversation): Conversation {
   const fallbackName = `Khách ${item.customerPsid.slice(-6)}`
   const customer = item.customerName?.trim() || fallbackName
+  const sortTs = new Date(item.lastMessageAt).getTime()
   return {
     id: item.id,
     pageId: item.pageId,
@@ -540,6 +546,7 @@ function mapStoredConversation(item: FacebookStoreConversation): Conversation {
     aiEstimatedTotalUsd: item.aiEstimatedTotalUsd,
     aiLastContextCacheHit: item.aiLastContextCacheHit,
     aiLastRunAt: item.aiLastRunAt,
+    lastMessageSortTs: Number.isFinite(sortTs) ? sortTs : 0,
   }
 }
 
@@ -668,9 +675,13 @@ async function triggerFacebookSync() {
 }
 
 function App() {
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    const current = document.documentElement.getAttribute('data-theme')
+    return current === 'dark' ? 'dark' : 'light'
+  })
   const [activeTab, setActiveTab] = useState<TabKey>('inbox')
   const [pages, setPages] = useState<Page[]>([])
-  const [selectedPageId, setSelectedPageId] = useState('all')
+  const [selectedPageId, setSelectedPageId] = useState('')
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [selectedConversationId, setSelectedConversationId] = useState('')
   const [draft, setDraft] = useState('')
@@ -685,6 +696,35 @@ function App() {
   const [pageSettingsPageId, setPageSettingsPageId] = useState<string | null>(null)
   const [pageModalBranch, setPageModalBranch] = useState('')
   const [pageModalMasterAi, setPageModalMasterAi] = useState(true)
+  const [isMobileInbox, setIsMobileInbox] = useState(() =>
+    typeof window !== 'undefined' ? window.matchMedia('(max-width: 940px)').matches : false,
+  )
+  const [mobileInboxPane, setMobileInboxPane] = useState<'pages' | 'conversations' | 'chat'>('pages')
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+    try {
+      localStorage.setItem('salon-theme', theme)
+    } catch {
+      // ignore
+    }
+  }, [theme])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const mq = window.matchMedia('(max-width: 940px)')
+    const onChange = (event: MediaQueryListEvent) => {
+      setIsMobileInbox(event.matches)
+      if (!event.matches) setMobileInboxPane('pages')
+    }
+    setIsMobileInbox(mq.matches)
+    if (typeof mq.addEventListener === 'function') {
+      mq.addEventListener('change', onChange)
+      return () => mq.removeEventListener('change', onChange)
+    }
+    mq.addListener(onChange)
+    return () => mq.removeListener(onChange)
+  }, [])
 
   useEffect(() => {
     let alive = true
@@ -725,13 +765,17 @@ function App() {
         if (!alive) return
         setPages(inboxData.pages)
         setConversations(inboxData.conversations)
-        if (inboxData.conversations.length) {
-          setSelectedConversationId((current) =>
-            inboxData.conversations.some((item) => item.id === current) ? current : inboxData.conversations[0].id,
-          )
-        } else {
-          setSelectedConversationId('')
-        }
+        setSelectedPageId((current) => {
+          if (!inboxData.pages.length) return ''
+          if (current === ALL_FANPAGES_ID) return ALL_FANPAGES_ID
+          if (current && inboxData.pages.some((page) => page.id === current)) return current
+          return inboxData.pages[0].id
+        })
+        setSelectedConversationId((current) => {
+          if (!inboxData.conversations.length) return ''
+          if (current && inboxData.conversations.some((item) => item.id === current)) return current
+          return inboxData.conversations[0].id
+        })
         setFacebookConversationError(null)
       } catch (e) {
         if (!alive) return
@@ -772,12 +816,29 @@ function App() {
   }, [pageSettingsPageId])
 
   const filteredConversations = useMemo(() => {
-    if (selectedPageId === 'all') return conversations
+    if (selectedPageId === ALL_FANPAGES_ID) {
+      return [...conversations].sort((a, b) => (b.lastMessageSortTs ?? 0) - (a.lastMessageSortTs ?? 0))
+    }
     return conversations.filter((item) => item.pageId === selectedPageId)
   }, [conversations, selectedPageId])
 
   const selectedConversation =
-    conversations.find((item) => item.id === selectedConversationId) ?? filteredConversations[0] ?? conversations[0]
+    filteredConversations.find((item) => item.id === selectedConversationId) ?? filteredConversations[0]
+
+  useEffect(() => {
+    if (!selectedPageId) return
+    const currentInPage = filteredConversations.find((item) => item.id === selectedConversationId)
+    if (!currentInPage) {
+      setSelectedConversationId(filteredConversations[0]?.id ?? '')
+    }
+  }, [selectedPageId, filteredConversations, selectedConversationId])
+
+  useEffect(() => {
+    if (!isMobileInbox) return
+    if (mobileInboxPane === 'chat' && !selectedConversation) {
+      setMobileInboxPane('conversations')
+    }
+  }, [isMobileInbox, mobileInboxPane, selectedConversation])
 
   const inboxMessagesScrollKey = useMemo(() => {
     if (!selectedConversation) return ''
@@ -923,6 +984,7 @@ function App() {
       ...conversation,
       status: 'human',
       lastMessageAt: nowTime(),
+      lastMessageSortTs: Date.now(),
       messages: [
         ...conversation.messages,
         {
@@ -969,22 +1031,29 @@ function App() {
         <div className="brand">
           <div className="brand-mark">TKW</div>
           <div>
-            <h1>Salon AI Inbox</h1>
-            <p>Fanpage messages + knowledge training</p>
+            <h1>Salon Tú Ka Wa</h1>
+            <p>Fanpage inbox + training AI</p>
           </div>
         </div>
+        <button
+          type="button"
+          className="ghost-button theme-toggle"
+          onClick={() => setTheme((v) => (v === 'dark' ? 'light' : 'dark'))}
+        >
+          {theme === 'dark' ? 'Light mode' : 'Dark mode'}
+        </button>
 
-        <nav className="tabs" aria-label="Khu vực làm việc">
+        <nav className="inbox-tabs" aria-label="Khu vực làm việc">
           <button
             type="button"
-            className={activeTab === 'inbox' ? 'tab active' : 'tab'}
+            className={activeTab === 'inbox' ? 'inbox-tab active' : 'inbox-tab'}
             onClick={() => setActiveTab('inbox')}
           >
             Inbox
           </button>
           <button
             type="button"
-            className={activeTab === 'training' ? 'tab active' : 'tab'}
+            className={activeTab === 'training' ? 'inbox-tab active' : 'inbox-tab'}
             onClick={() => setActiveTab('training')}
           >
             Training
@@ -1016,11 +1085,16 @@ function App() {
       </aside>
 
       <main className="workspace">
-        {activeTab === 'inbox' ? (
-          <>
+        <section
+          className="workspace-section workspace-section-inbox"
+          aria-hidden={activeTab !== 'inbox'}
+          style={{ display: activeTab === 'inbox' ? undefined : 'none' }}
+        >
+          <div className="inbox-section-shell">
             <section className="topbar">
               <div>
-                <p className="eyebrow">Quản lý fanpage</p>
+                <p className="eyebrow">Developer: Nguyễn Việt Sơn</p>
+                <p className="topbar-contact">Contact: 0978478240</p>
               </div>
               <div className="topbar-actions">
                 <button type="button" className="ghost-button" onClick={() => void handleSync()}>
@@ -1031,33 +1105,44 @@ function App() {
 
             {facebookConversationError && <div className="notice error">{facebookConversationError}</div>}
 
-            <section className="inbox-layout">
+            <section
+              className={`inbox-layout${isMobileInbox ? ' mobile' : ''}${isMobileInbox ? ` show-${mobileInboxPane}` : ''}`}
+            >
+              <div className="inbox-list-pane">
               <div className="page-panel">
-                <label className="field-label" htmlFor="page-filter">
-                  Fanpage
-                </label>
-                <select
-                  id="page-filter"
-                  value={selectedPageId}
-                  onChange={(e) => {
-                    const nextPageId = e.target.value
-                    setSelectedPageId(nextPageId)
-                    const nextConversation =
-                      nextPageId === 'all'
-                        ? conversations[0]
-                        : conversations.find((item) => item.pageId === nextPageId)
-                    if (nextConversation) setSelectedConversationId(nextConversation.id)
-                  }}
-                >
-                  <option value="all">Tất cả fanpage</option>
-                  {pages.map((page) => (
-                    <option key={page.id} value={page.id}>
-                      {page.name}
-                    </option>
-                  ))}
-                </select>
+                <div className="field-label">Fanpage</div>
 
                 <div className="page-list">
+                  {pages.length > 0 && (
+                    <div
+                      className={
+                        selectedPageId === ALL_FANPAGES_ID ? 'page-row page-row-all-fanpages active' : 'page-row page-row-all-fanpages'
+                      }
+                    >
+                      <button
+                        type="button"
+                        className="page-row-main"
+                        onClick={() => {
+                          setSelectedPageId(ALL_FANPAGES_ID)
+                          const sorted = [...conversations].sort(
+                            (a, b) => (b.lastMessageSortTs ?? 0) - (a.lastMessageSortTs ?? 0),
+                          )
+                          const first = sorted[0]
+                          if (first) setSelectedConversationId(first.id)
+                          if (isMobileInbox) setMobileInboxPane('conversations')
+                        }}
+                      >
+                        <span className="page-icon" aria-hidden>
+                          ⧉
+                        </span>
+                        <span>
+                          <strong>Tất cả fanpage</strong>
+                          <small>Xem tin nhắn gộp mọi trang</small>
+                        </span>
+                        {totalUnread > 0 ? <b>{totalUnread}</b> : null}
+                      </button>
+                    </div>
+                  )}
                   {pages.map((page) => (
                     <div
                       key={page.id}
@@ -1068,8 +1153,12 @@ function App() {
                         className="page-row-main"
                         onClick={() => {
                           setSelectedPageId(page.id)
-                          const next = conversations.find((item) => item.pageId === page.id)
+                          const forPage = conversations
+                            .filter((item) => item.pageId === page.id)
+                            .sort((a, b) => (b.lastMessageSortTs ?? 0) - (a.lastMessageSortTs ?? 0))
+                          const next = forPage[0]
                           if (next) setSelectedConversationId(next.id)
+                          if (isMobileInbox) setMobileInboxPane('conversations')
                         }}
                       >
                         <PageAvatar page={page} />
@@ -1112,6 +1201,18 @@ function App() {
               </div>
 
               <div className="conversation-list" aria-label="Danh sách hội thoại">
+                {isMobileInbox && (
+                  <div className="mobile-subhead">
+                    <button type="button" className="mobile-back-btn" onClick={() => setMobileInboxPane('pages')}>
+                      ← Trang
+                    </button>
+                    <strong>
+                      {selectedPageId === ALL_FANPAGES_ID
+                        ? 'Tất cả fanpage'
+                        : (pages.find((p) => p.id === selectedPageId)?.name ?? 'Hội thoại')}
+                    </strong>
+                  </div>
+                )}
                 {!filteredConversations.length && (
                   <div className="empty-panel">
                     <strong>Chưa có hội thoại thật</strong>
@@ -1127,7 +1228,10 @@ function App() {
                         ? 'conversation-row active'
                         : 'conversation-row'
                     }
-                    onClick={() => setSelectedConversationId(conversation.id)}
+                    onClick={() => {
+                      setSelectedConversationId(conversation.id)
+                      if (isMobileInbox) setMobileInboxPane('chat')
+                    }}
                   >
                     <Avatar conversation={conversation} />
                     <span className="conversation-main">
@@ -1154,11 +1258,22 @@ function App() {
                   </button>
                 ))}
               </div>
+              </div>
 
               {selectedConversation && (
                 <section className="chat-panel">
                   <header className="chat-head">
                     <div className="customer-title">
+                      {isMobileInbox && (
+                        <button
+                          type="button"
+                          className="chat-back"
+                          onClick={() => setMobileInboxPane('conversations')}
+                          aria-label="Quay lại danh sách"
+                        >
+                          ← Tin nhắn
+                        </button>
+                      )}
                       <Avatar conversation={selectedConversation} large />
                       <div>
                         <h3>{selectedConversation.customer}</h3>
@@ -1326,7 +1441,7 @@ function App() {
                     })}
                   </div>
 
-                  <footer className="composer">
+                  <footer className="inbox-composer">
                     <input
                       ref={composerFileRef}
                       type="file"
@@ -1450,10 +1565,15 @@ function App() {
                 </div>
               </div>
             ) : null}
-          </>
-        ) : (
+          </div>
+        </section>
+        <section
+          className="workspace-section workspace-section-training"
+          aria-hidden={activeTab !== 'training'}
+          style={{ display: activeTab === 'training' ? undefined : 'none' }}
+        >
           <TrainingChat title="Training & cập nhật kiến thức" />
-        )}
+        </section>
       </main>
 
     </div>
@@ -1461,10 +1581,3 @@ function App() {
 }
 
 export default App
-
-
-
-
-
-
-

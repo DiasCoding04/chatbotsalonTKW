@@ -1,5 +1,6 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
+import { getVertexAccessToken } from './vertex-auth.ts'
 import {
   BRANCH_PAGES,
   isSalonPlaceholderMessageText,
@@ -9,6 +10,17 @@ import {
 const DATA_DIR = process.env.CONTEXT_DATA_DIR?.trim() || resolve(process.cwd(), 'data')
 const FACEBOOK_STORE_FILE =
   process.env.FACEBOOK_STORE_PATH?.trim() || resolve(DATA_DIR, 'facebook-conversations.json')
+const FACEBOOK_STORE_BACKEND =
+  process.env.FACEBOOK_STORE_BACKEND?.trim().toLowerCase() ||
+  (process.env.K_SERVICE ? 'firestore' : 'file')
+const FIRESTORE_PROJECT_ID =
+  process.env.FACEBOOK_STORE_FIRESTORE_PROJECT_ID?.trim() ||
+  process.env.VERTEX_AI_PROJECT_ID?.trim() ||
+  process.env.GOOGLE_CLOUD_PROJECT?.trim() ||
+  ''
+const FIRESTORE_DATABASE = process.env.FACEBOOK_STORE_FIRESTORE_DATABASE?.trim() || '(default)'
+const FIRESTORE_COLLECTION = process.env.FACEBOOK_STORE_FIRESTORE_COLLECTION?.trim() || 'salon_chat'
+const FIRESTORE_DOC_ID = process.env.FACEBOOK_STORE_FIRESTORE_DOC_ID?.trim() || 'facebook_store'
 
 export type FacebookAdAttribution = {
   source?: string
@@ -146,7 +158,21 @@ function emptyStore(): FacebookStore {
   return { pages: [], conversations: [], updatedAt: new Date().toISOString() }
 }
 
-async function readStore(): Promise<FacebookStore> {
+type FirestoreDoc = {
+  fields?: {
+    json?: { stringValue?: string }
+  }
+}
+
+function firestoreDocName(): string {
+  return `projects/${FIRESTORE_PROJECT_ID}/databases/${FIRESTORE_DATABASE}/documents/${FIRESTORE_COLLECTION}/${FIRESTORE_DOC_ID}`
+}
+
+function firestoreDocUrl(): string {
+  return `https://firestore.googleapis.com/v1/${firestoreDocName()}`
+}
+
+async function readStoreFromFile(): Promise<FacebookStore> {
   try {
     const raw = await readFile(FACEBOOK_STORE_FILE, 'utf8')
     const parsed = JSON.parse(raw) as Partial<FacebookStore>
@@ -160,9 +186,79 @@ async function readStore(): Promise<FacebookStore> {
   }
 }
 
-async function writeStore(store: FacebookStore): Promise<void> {
+async function writeStoreToFile(store: FacebookStore): Promise<void> {
   await mkdir(DATA_DIR, { recursive: true })
   await writeFile(FACEBOOK_STORE_FILE, JSON.stringify(store, null, 2), 'utf8')
+}
+
+async function readStoreFromFirestore(): Promise<FacebookStore | null> {
+  if (!FIRESTORE_PROJECT_ID) return null
+  const token = await getVertexAccessToken()
+  const res = await fetch(firestoreDocUrl(), {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  if (res.status === 404) return null
+  const raw = await res.text()
+  if (!res.ok) throw new Error(raw || `Firestore read failed (${res.status})`)
+  const doc = JSON.parse(raw) as FirestoreDoc
+  const jsonText = doc.fields?.json?.stringValue
+  if (!jsonText) return null
+  try {
+    return JSON.parse(jsonText) as FacebookStore
+  } catch {
+    return null
+  }
+}
+
+async function writeStoreToFirestore(store: FacebookStore): Promise<void> {
+  if (!FIRESTORE_PROJECT_ID) throw new Error('Thiếu FIRESTORE project id cho Facebook store.')
+  const token = await getVertexAccessToken()
+  const payload = {
+    name: firestoreDocName(),
+    fields: {
+      json: { stringValue: JSON.stringify(store) },
+    },
+  }
+  const res = await fetch(firestoreDocUrl(), {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json; charset=utf-8',
+    },
+    body: JSON.stringify(payload),
+  })
+  const raw = await res.text()
+  if (!res.ok) throw new Error(raw || `Firestore write failed (${res.status})`)
+}
+
+async function readStore(): Promise<FacebookStore> {
+  if (FACEBOOK_STORE_BACKEND === 'file') {
+    return readStoreFromFile()
+  }
+  try {
+    const firestoreStore = await readStoreFromFirestore()
+    if (firestoreStore) return firestoreStore
+  } catch (e) {
+    console.warn('[facebook-store] Firestore read fallback to file:', e)
+  }
+  const fileStore = await readStoreFromFile()
+  if (fileStore.conversations.length || fileStore.pages.length) {
+    try {
+      await writeStoreToFirestore(fileStore)
+      console.log('[facebook-store] Seeded Firestore from file store.')
+    } catch (e) {
+      console.warn('[facebook-store] Could not seed Firestore from file store:', e)
+    }
+  }
+  return fileStore
+}
+
+async function writeStore(store: FacebookStore): Promise<void> {
+  if (FACEBOOK_STORE_BACKEND === 'file') {
+    await writeStoreToFile(store)
+    return
+  }
+  await writeStoreToFirestore(store)
 }
 
 function isoFromMetaTimestamp(timestamp?: number): string {

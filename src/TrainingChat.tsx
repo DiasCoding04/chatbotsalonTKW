@@ -29,7 +29,7 @@ import {
 } from './components/StreamingBubble'
 import { ContextEditor } from './components/ContextEditor'
 import { ModelMessageBubbles } from './components/ModelMessageBubbles'
-import { fetchServerContext, fetchServerImageSamples } from './lib/context-api'
+import { fetchServerContext, fetchServerHealth, fetchServerImageSamples } from './lib/context-api'
 import {
   BRANCH_PAGES,
   buildSalonSystemPrompt,
@@ -238,6 +238,9 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
   const [contextBanner, setContextBanner] = useState<ContextBanner>(null)
   const [contextFromServer, setContextFromServer] = useState(false)
   const [contextRequiresEditToken, setContextRequiresEditToken] = useState(false)
+  const [serverGeminiReady, setServerGeminiReady] = useState(false)
+  const [serverGeminiBackend, setServerGeminiBackend] = useState<'vertex' | 'developer' | null>(null)
+  const [serverHealthChecked, setServerHealthChecked] = useState(false)
   const [contextEditorOpen, setContextEditorOpen] = useState(false)
   const [messages, setMessages] = useState<Msg[]>([])
   const [stats, setStats] = useState<Stats>(EMPTY_STATS)
@@ -359,6 +362,23 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
     void loadContext()
   }, [loadContext])
 
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      try {
+        const health = await fetchServerHealth()
+        if (cancelled || !health) return
+        setServerGeminiReady(Boolean(health.geminiServerReady))
+        setServerGeminiBackend(health.geminiBackend ?? null)
+      } finally {
+        if (!cancelled) setServerHealthChecked(true)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
   const selectedBranch = useMemo(
     () => BRANCH_PAGES.find((branch) => branch.id === selectedBranchId) ?? BRANCH_PAGES[0],
     [selectedBranchId],
@@ -405,7 +425,7 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
       setCacheStatus({ kind: 'idle' })
       return
     }
-    if (!geminiReady || !systemPrompt.trim()) {
+    if (!(geminiReady || serverGeminiReady) || !systemPrompt.trim()) {
       cacheNameRef.current = null
       setCacheStatus({ kind: 'idle' })
       return
@@ -438,7 +458,7 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
       cancelled = true
       cacheNameRef.current = null
     }
-  }, [isGemini, apiKey, geminiReady, model, systemPrompt])
+  }, [isGemini, apiKey, geminiReady, serverGeminiReady, model, systemPrompt])
 
   useEffect(() => {
     if (!isGemini || !contextCacheFingerprint) return
@@ -699,7 +719,7 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
   function send() {
     const text = input.trim()
     const images = pendingImages
-    if ((!text && !images.length) || (isGemini ? !geminiReady : !apiKey)) return
+    if ((!text && !images.length) || (isGemini ? !geminiRuntimeReady : !apiKey.trim())) return
 
     if (isGemini) {
       window.clearTimeout(bgMetricsTimerRef.current)
@@ -737,7 +757,10 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
     setLoading(false)
   }
 
-  const missingKey = isGemini ? !geminiReady : !apiKey.trim()
+  const geminiRuntimeReady = geminiReady || serverGeminiReady
+  const missingKey = isGemini
+    ? serverHealthChecked && !geminiRuntimeReady
+    : !apiKey.trim()
   const canSend = Boolean(input.trim() || pendingImages.length)
   const usdVndRate = Number(import.meta.env.VITE_USD_VND) || 26_000
 
@@ -790,7 +813,16 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
 
   function CacheChip() {
     if (!isGemini) return null
-    if (cacheStatus.kind === 'idle') return null
+    if (cacheStatus.kind === 'idle') {
+      return (
+        <span
+          className="model-strip-meta"
+          title="Chưa khởi tạo cache (đang chờ runtime sẵn sàng hoặc chưa có system prompt)."
+        >
+          · cache: chưa khởi tạo
+        </span>
+      )
+    }
     if (cacheStatus.kind === 'loading') {
       return (
         <span className="model-strip-meta" title="Đang tạo Context Cache cho systemInstruction">
@@ -829,9 +861,12 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
       .map((part) => part[0]?.toUpperCase() ?? '')
       .join('') || 'AI'
 
-  const headerStatus = missingKey
-    ? { className: 'status-dot warn', label: 'Thiếu API key' }
-    : loading
+  const headerStatus =
+    isGemini && !serverHealthChecked && !geminiReady
+      ? { className: 'status-dot idle', label: 'Đang kiểm tra server' }
+      : missingKey
+        ? { className: 'status-dot warn', label: 'Thiếu API key' }
+        : loading
       ? { className: 'status-dot', label: 'Đang phản hồi' }
       : awaitingCustomer
         ? { className: 'status-dot warn', label: 'Chờ 15 giây' }
@@ -849,6 +884,12 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
             <span className={headerStatus.className}>{headerStatus.label}</span>
             <span>
               Provider <code>{isGemini ? 'gemini' : 'openai'}</code>
+              {isGemini && serverGeminiBackend ? (
+                <>
+                  {' '}
+                  · backend <code>{serverGeminiBackend}</code>
+                </>
+              ) : null}
             </span>
             <span>
               · model <code>{model}</code>
@@ -863,10 +904,10 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
       {missingKey && (
         <div className="banner error">
           {isGemini ? (
-            geminiProxyInjectsKey ? (
+            geminiProxyInjectsKey || serverGeminiBackend === 'vertex' ? (
               <>
-                Server chưa cấu hình <code>GEMINI_API_KEY</code> (proxy Gemini). Kiểm tra file env trên máy chủ và
-                khởi động lại dịch vụ.
+                Server chưa sẵn sàng backend Gemini ({serverGeminiBackend ?? 'developer'}). Kiểm tra biến môi trường
+                trên Cloud Run rồi deploy lại.
               </>
             ) : (
               <>

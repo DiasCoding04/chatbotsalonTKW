@@ -20,7 +20,6 @@ COPY --from=builder /usr/src/app/package.json ./package.json
 COPY --from=builder /usr/src/app/dist ./dist
 COPY --from=builder /usr/src/app/dist-server ./dist-server
 COPY --from=builder /usr/src/app/public ./public
-COPY --from=builder /usr/src/app/.env.example ./.env.example
 
 ENV NODE_ENV=production
 ENV APP_PUBLIC_URL=https://chatbot.salontukawa.com

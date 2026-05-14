@@ -25,6 +25,7 @@ import {
 
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta'
 const THINKING_CONFIG = { thinkingBudget: 0 } as const
+const IMAGE_SAMPLES_BASE_URL = process.env.IMAGE_SAMPLES_BASE_URL?.trim() || ''
 
 /** Không import `facebook.ts` (tránh vòng phụ thuộc). */
 function parseAllowedMetaImageFetchUrl(raw: string): URL | null {
@@ -192,8 +193,8 @@ async function generateGeminiTextCachedOnly(
   return { text, usageMetadata: data.usageMetadata }
 }
 
-/** Tối đa N tin Messenger gần nhất: chữ đủ cho ngữ cảnh; pixel ảnh chỉ tin khách đang kích hoạt AI (`last.id`). */
-const FACEBOOK_AI_HISTORY_MAX_MESSAGES = 15
+/** AI phải đọc đủ 15 tin có text. Tin chỉ ảnh/file không được tính quota text. */
+const FACEBOOK_AI_HISTORY_MAX_TEXT_MESSAGES = 15
 
 const MAX_IMAGE_BYTES_FOR_GEMINI = 4 * 1024 * 1024
 const MAX_IMAGES_PER_USER_TURN = 8
@@ -366,6 +367,60 @@ function storedMessagesToPartialTurns(
   return out
 }
 
+function hasCountableTextMessage(message: {
+  text: string
+  author: 'customer' | 'page' | 'system'
+}): boolean {
+  const text = message.text.trim()
+  if (!text) return false
+  if (message.author === 'customer' && isSalonPlaceholderMessageText(text)) return false
+  return true
+}
+
+function selectAiHistoryMessages(
+  messages: Array<{
+    id: string
+    author: 'customer' | 'page' | 'system'
+    text: string
+    images?: string[]
+    videos?: string[]
+    audios?: string[]
+  }>,
+  latestCustomerMessageId: string,
+  maxTextMessages: number,
+): Array<{
+  id: string
+  author: 'customer' | 'page' | 'system'
+  text: string
+  images?: string[]
+  videos?: string[]
+  audios?: string[]
+}> {
+  const picked: Array<{
+    id: string
+    author: 'customer' | 'page' | 'system'
+    text: string
+    images?: string[]
+    videos?: string[]
+    audios?: string[]
+  }> = []
+
+  let textQuota = 0
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    const isLatestCustomerMessage = m.id === latestCustomerMessageId
+    const countableText = hasCountableTextMessage(m)
+
+    if (!isLatestCustomerMessage && !countableText) continue
+    if (!isLatestCustomerMessage && textQuota >= maxTextMessages) continue
+
+    picked.push(m)
+    if (countableText) textQuota += 1
+  }
+
+  return picked.reverse()
+}
+
 function resolveGeminiModelId(): string {
   const vertex = useVertexGeminiBackend()
   const m = (vertex ? process.env.VERTEX_AI_MODEL : process.env.VITE_GEMINI_MODEL)?.trim()
@@ -413,11 +468,11 @@ async function executeFacebookAiReply(
     const ttl = Number(process.env.GEMINI_CONTEXT_CACHE_TTL_S) || 3600
     const model = resolveGeminiModelId()
 
-    const msgSlice =
-      conv.messages.length > FACEBOOK_AI_HISTORY_MAX_MESSAGES
-        ? conv.messages.slice(-FACEBOOK_AI_HISTORY_MAX_MESSAGES)
-        : conv.messages
-
+    const msgSlice = selectAiHistoryMessages(
+      conv.messages,
+      last.id,
+      FACEBOOK_AI_HISTORY_MAX_TEXT_MESSAGES,
+    )
     const partialHistory = storedMessagesToPartialTurns({ messages: msgSlice }, last.id)
     if (!partialHistory.length || partialHistory[partialHistory.length - 1]?.role !== 'user') return
 
@@ -471,6 +526,7 @@ async function executeFacebookAiReply(
     const lastUser = lastUserTurnPlainText(history)
     const expanded = expandModelImageSampleMarkers(raw, groups, lastUser, {
       inferImageKeysFromModelOnly: true,
+      imageBaseUrl: IMAGE_SAMPLES_BASE_URL,
     })
     const chunks = splitAiReplyIntoFacebookMessages(expanded.apiText.trim())
     const imageUrls = expanded.imageUrls

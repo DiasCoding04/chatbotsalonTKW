@@ -1,7 +1,7 @@
 /* ============================================================
    Layout shell
    ============================================================ */
-.app {
+.legacy-chatbot.app {
   flex: 1;
   display: flex;
   flex-direction: column;
@@ -23,7 +23,7 @@
 /* ============================================================
    Header
    ============================================================ */
-.header {
+.legacy-chatbot .header {
   position: relative;
   display: flex;
   align-items: center;
@@ -165,7 +165,7 @@
 /* ============================================================
    Banners
    ============================================================ */
-.banner {
+.legacy-chatbot .banner {
   display: flex;
   align-items: flex-start;
   gap: 0.55rem;
@@ -264,7 +264,7 @@
 /* ============================================================
    Model strip / cache chip
    ============================================================ */
-.model-strip {
+.legacy-chatbot .model-strip {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
@@ -291,7 +291,7 @@
 /* ============================================================
    Toolbar
    ============================================================ */
-.toolbar {
+.legacy-chatbot .toolbar {
   display: flex;
   gap: 0.45rem;
   align-items: center;
@@ -385,7 +385,7 @@
 /* ============================================================
    Stats / cost / timing panels
    ============================================================ */
-.stats {
+.legacy-chatbot .stats {
   display: flex;
   gap: 0.9rem;
   flex-wrap: wrap;
@@ -611,7 +611,7 @@
 /* ============================================================
    Chat area
    ============================================================ */
-.chat {
+.legacy-chatbot .chat {
   flex: 1;
   min-height: min(56dvh, 540px);
   max-height: min(70dvh, 720px);
@@ -755,7 +755,7 @@
 /* ============================================================
    Composer
    ============================================================ */
-.composer {
+.legacy-chatbot .composer {
   display: flex;
   gap: 0.5rem;
   align-items: center;
@@ -870,7 +870,7 @@
 /* ============================================================
    Message images & pending attachments
    ============================================================ */
-.msg-images,
+.legacy-chatbot .msg-images,
 .legacy-chatbot .pending-images {
   display: flex;
   flex-wrap: wrap;
@@ -943,7 +943,7 @@
 /* ============================================================
    Inline image gallery inside model bubbles
    ============================================================ */
-.bubble-gallery {
+.legacy-chatbot .bubble-gallery {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
   gap: 0.5rem;
@@ -1026,7 +1026,7 @@
 /* ============================================================
    Context editor modal
    ============================================================ */
-.context-editor-backdrop {
+.legacy-chatbot .context-editor-backdrop {
   position: fixed;
   inset: 0;
   z-index: 40;
@@ -1167,5 +1167,43 @@
     animation: none !important;
   }
 }
+
+@media (max-width: 940px) {
+  .legacy-chatbot.app {
+    padding: 0.6rem 0.45rem 0.7rem;
+    gap: 0.55rem;
+  }
+
+  .legacy-chatbot .header,
+  .legacy-chatbot .toolbar,
+  .legacy-chatbot .model-strip,
+  .legacy-chatbot .timing-strip,
+  .legacy-chatbot .cost-details,
+  .legacy-chatbot .composer {
+    border-radius: 12px;
+  }
+
+  .legacy-chatbot .chat {
+    min-height: 42dvh;
+    max-height: 52dvh;
+    padding: 0.7rem 0.65rem 0.8rem;
+  }
+
+  .legacy-chatbot .composer {
+    padding: 0.4rem;
+    gap: 0.35rem;
+  }
+
+  .legacy-chatbot .composer button.send {
+    height: 42px;
+    padding: 0 0.8rem;
+  }
+
+  .legacy-chatbot .composer button.attach {
+    height: 42px;
+    width: 42px;
+  }
+}
+
 
 

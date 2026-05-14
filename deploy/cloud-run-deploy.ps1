@@ -1,13 +1,21 @@
 param(
   [string]$Project = 'gen-lang-client-0335766885',
-  [string]$Region = 'europe-west1',
+  [string]$Region = 'asia-southeast1',
   [string]$Service = 'chatbot-tkw',
   [string]$EnvFile = "$PSScriptRoot\env\server.env",
   [string]$SecretName = 'vertex-service-account-json'
 )
 
-if (-not (Get-Command gcloud -ErrorAction SilentlyContinue)) {
-  Write-Error 'gcloud CLI is not installed or not available in PATH. Install Google Cloud SDK before running this script.'
+$gcloudCmd = Get-Command gcloud -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue
+if (-not $gcloudCmd) {
+  $fallbackPath = 'C:\Program Files (x86)\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd'
+  if (Test-Path $fallbackPath) {
+    $gcloudCmd = $fallbackPath
+  }
+}
+
+if (-not $gcloudCmd) {
+  Write-Error 'gcloud CLI is not installed or not available in PATH. Install Google Cloud SDK or add it to PATH before running this script.'
   exit 1
 }
 
@@ -27,24 +35,28 @@ Get-Content $EnvFile | ForEach-Object {
   $envData[$key] = $value
 }
 
-$setVars = @()
+$runtimeEnvPath = [System.IO.Path]::GetTempFileName()
+$runtimeEnvLines = @()
 foreach ($key in $envData.Keys) {
   if ($key -eq 'GOOGLE_APPLICATION_CREDENTIALS') { continue }
   if ($key -eq 'VERTEX_SERVICE_ACCOUNT_JSON') { continue }
-  $setVars += "$key=$($envData[$key])"
+  $val = [string]$envData[$key]
+  $escaped = $val.Replace("'", "''")
+  $runtimeEnvLines += "${key}: '$escaped'"
 }
+Set-Content -Path $runtimeEnvPath -Value ($runtimeEnvLines -join [Environment]::NewLine) -NoNewline
 
 $secretArgs = @()
 if ($envData.ContainsKey('VERTEX_SERVICE_ACCOUNT_JSON')) {
   $secretArgs += "VERTEX_SERVICE_ACCOUNT_JSON=$SecretName:latest"
-  if (-not (gcloud secrets describe $SecretName --project $Project 2>$null)) {
+  if (-not (& $gcloudCmd secrets describe $SecretName --project $Project 2>$null)) {
     Write-Host "Creating secret $SecretName in project $Project..."
-    gcloud secrets create $SecretName --project=$Project --replication-policy=automatic
+    & $gcloudCmd secrets create $SecretName --project=$Project --replication-policy=automatic --quiet
   }
   Write-Host "Updating secret $SecretName with currently defined VERTEX_SERVICE_ACCOUNT_JSON value..."
   $tmpFile = [System.IO.Path]::GetTempFileName()
   Set-Content -Path $tmpFile -Value $envData['VERTEX_SERVICE_ACCOUNT_JSON'] -NoNewline
-  gcloud secrets versions add $SecretName --data-file=$tmpFile --project=$Project
+  & $gcloudCmd secrets versions add $SecretName --data-file=$tmpFile --project=$Project --quiet
   Remove-Item $tmpFile
 } elseif ($envData.ContainsKey('GOOGLE_APPLICATION_CREDENTIALS')) {
   $gcpPath = $envData['GOOGLE_APPLICATION_CREDENTIALS']
@@ -52,17 +64,15 @@ if ($envData.ContainsKey('VERTEX_SERVICE_ACCOUNT_JSON')) {
     Write-Warning "Google service account file path does not exist locally: $gcpPath"
     Write-Warning 'You must create or mount the Vertex service account JSON as a Secret Manager secret, or update VERTEX_SERVICE_ACCOUNT_JSON in the env file.'
   } else {
-    if (-not (gcloud secrets describe $SecretName --project $Project 2>$null)) {
+    if (-not (& $gcloudCmd secrets describe $SecretName --project $Project 2>$null)) {
       Write-Host "Creating secret $SecretName in project $Project..."
-      gcloud secrets create $SecretName --project=$Project --replication-policy=automatic
+      & $gcloudCmd secrets create $SecretName --project=$Project --replication-policy=automatic --quiet
     }
     Write-Host "Updating secret $SecretName with service account file from $gcpPath..."
-    gcloud secrets versions add $SecretName --data-file=$gcpPath --project=$Project
+    & $gcloudCmd secrets versions add $SecretName --data-file=$gcpPath --project=$Project --quiet
     $secretArgs += "VERTEX_SERVICE_ACCOUNT_JSON=$SecretName:latest"
   }
 }
-
-$setEnvArgument = $setVars -join ','
 
 Write-Host 'Deploying Cloud Run service...'
 $sourcePath = (Resolve-Path "$PSScriptRoot\.." ).Path
@@ -72,10 +82,14 @@ $deployArgs = @(
   '--region', $Region,
   '--platform', 'managed',
   '--source', $sourcePath,
-  '--allow-unauthenticated'
+  '--allow-unauthenticated',
+  '--quiet'
 )
-if ($setEnvArgument) { $deployArgs += @('--set-env-vars', $setEnvArgument) }
+$deployArgs += @('--env-vars-file', $runtimeEnvPath)
 if ($secretArgs.Count -gt 0) { $deployArgs += @('--update-secrets', ($secretArgs -join ',')) }
 
-Write-Host "gcloud $($deployArgs -join ' ')"
-gcloud @deployArgs
+Write-Host "& $gcloudCmd $($deployArgs -join ' ')"
+& $gcloudCmd @deployArgs
+$exitCode = $LASTEXITCODE
+Remove-Item $runtimeEnvPath -ErrorAction SilentlyContinue
+exit $exitCode

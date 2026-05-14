@@ -49,39 +49,66 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #110d09;
-    --bg-grad-1: #1b140d;
-    --bg-grad-2: #100b07;
-    --bg-grad-3: #251a0f;
-    --surface: #1c1611;
-    --surface-2: #221a13;
-    --surface-glass: rgba(28, 22, 17, 0.72);
-    --text: #f7eedf;
-    --text-soft: #d8cab2;
-    --muted: #a89a83;
-    --border: #3a2f23;
-    --border-strong: #4d3e2c;
-    --accent: #e2b073;
-    --accent-strong: #d8a05b;
-    --accent-grad-1: #f0c285;
-    --accent-grad-2: #b27725;
-    --accent-soft: #2a2118;
-    --accent-soft-2: #312618;
-    --user-bubble-grad-1: #e6c189;
-    --user-bubble-grad-2: #b48344;
-    --user-text: #1a120a;
-    --model-bubble: #1f1812;
-    --model-bubble-border: #3a2f23;
-    --danger: #f97066;
-    --warn: #f59e0b;
-    --success: #4ade80;
-    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.45), 0 1px 1px rgba(0, 0, 0, 0.35);
-    --shadow-md: 0 6px 18px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.35);
-    --shadow-lg: 0 22px 48px rgba(0, 0, 0, 0.5), 0 8px 18px rgba(0, 0, 0, 0.35);
-    --shadow-accent: 0 10px 24px rgba(226, 176, 115, 0.18);
-  }
+/* Keep a consistent visual language across Inbox + Training on production.
+   We intentionally avoid auto dark-switch to prevent "two different apps" look. */
+:root {
+  color-scheme: light;
+  --bg: #f7f3ee;
+  --bg-grad-1: #f9efe2;
+  --bg-grad-2: #fbf5ee;
+  --bg-grad-3: #efe2cf;
+  --surface: #ffffff;
+  --surface-2: #fbf7f2;
+  --surface-glass: rgba(255, 255, 255, 0.72);
+  --text: #1f1b17;
+  --text-soft: #4a423a;
+  --muted: #7a6f63;
+  --border: #e7dccc;
+  --border-strong: #d6c6ad;
+  --accent: #9a6a1f;
+  --accent-strong: #7c5414;
+  --accent-grad-1: #c69044;
+  --accent-grad-2: #8b5a16;
+  --accent-soft: #f4e7d2;
+  --accent-soft-2: #fbf1de;
+  --user-bubble-grad-1: #2a221c;
+  --user-bubble-grad-2: #463524;
+  --user-text: #fff8ec;
+  --model-bubble: #ffffff;
+  --model-bubble-border: #ece2d1;
+  --danger: #b42318;
+  --warn: #b45309;
+  --success: #15803d;
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #0f0f12;
+  --bg-grad-1: #1a1a22;
+  --bg-grad-2: #121218;
+  --bg-grad-3: #232331;
+  --surface: #1a1b22;
+  --surface-2: #232531;
+  --surface-glass: rgba(26, 27, 34, 0.72);
+  --text: #f4f3ef;
+  --text-soft: #d7d3c8;
+  --muted: #a9a49a;
+  --border: #3a3d4b;
+  --border-strong: #4c5061;
+  --accent: #d8a35c;
+  --accent-strong: #e1b274;
+  --accent-grad-1: #e4bc85;
+  --accent-grad-2: #ad7430;
+  --accent-soft: #2d261f;
+  --accent-soft-2: #352c24;
+  --user-bubble-grad-1: #e4bc85;
+  --user-bubble-grad-2: #b97e37;
+  --user-text: #1d1409;
+  --model-bubble: #252833;
+  --model-bubble-border: #3c4050;
+  --danger: #ff6b6b;
+  --warn: #f2b44f;
+  --success: #4fd08b;
 }
 
 * {

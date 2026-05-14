@@ -149,6 +149,32 @@ export function extractImageSampleUrls(text: string): string[] {
   )
 }
 
+function normalizePublicImageBaseUrl(baseUrl?: string): string {
+  const raw = (baseUrl ?? '').trim()
+  if (!raw) return ''
+  const withProtocol = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`
+  try {
+    const u = new URL(withProtocol)
+    u.hash = ''
+    u.search = ''
+    return u.toString().replace(/\/+$/, '')
+  } catch {
+    return ''
+  }
+}
+
+export function resolveImageSampleUrl(rawUrl: string, baseUrl?: string): string {
+  const trimmed = rawUrl.trim()
+  if (!trimmed) return ''
+  if (/^https?:\/\//i.test(trimmed)) return trimmed
+
+  const base = normalizePublicImageBaseUrl(baseUrl)
+  if (!base) return trimmed
+
+  const cleanPath = trimmed.replace(/^\.?\/*/, '')
+  return `${base}/${cleanPath}`
+}
+
 export function parseImageSampleGroups(markdown: string): ImageSampleGroup[] {
   const groups: ImageSampleGroup[] = []
   const seenKeys = new Set<string>()
@@ -238,7 +264,7 @@ export function expandModelImageSampleMarkers(
   groups: ImageSampleGroup[],
   triggerText: string,
   /** Inbox: tin khách có boilerplate "ảnh/…" làm bật `inferImageSampleKeys` nhầm — chỉ suy từ câu model. */
-  opts?: { inferImageKeysFromModelOnly?: boolean },
+  opts?: { inferImageKeysFromModelOnly?: boolean; imageBaseUrl?: string },
 ): { apiText: string; displayText: string; imageUrls: string[] } {
   const groupsByKey = new Map(groups.map((group) => [group.key, group]))
   const markerKeys: string[] = []
@@ -268,8 +294,11 @@ export function expandModelImageSampleMarkers(
   for (const key of keys) {
     const group = groupsByKey.get(key)
     if (!group) continue
-    displayAdditions.push([`Ảnh mẫu ${group.label}:`, ...group.urls].join('\n'))
-    for (const u of group.urls) {
+    const resolvedUrls = group.urls
+      .map((u) => resolveImageSampleUrl(u, opts?.imageBaseUrl))
+      .filter((u) => u.length > 0)
+    displayAdditions.push([`Ảnh mẫu ${group.label}:`, ...resolvedUrls].join('\n'))
+    for (const u of resolvedUrls) {
       const t = u.trim()
       if (!t || seenUrl.has(t)) continue
       seenUrl.add(t)

@@ -16,7 +16,8 @@
     "start:prod": "node dist-server/server/index.js",
     "start:server": "tsx server/index.ts",
     "pack:release": "node scripts/pack-release.mjs",
-    "pack:update": "node scripts/pack-update.mjs"
+    "pack:update": "node scripts/pack-update.mjs",
+    "assets:upload:gcs": "node scripts/upload-image-samples-to-gcs.mjs"
   },
   "engines": {
     "node": ">=20"

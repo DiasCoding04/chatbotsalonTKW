@@ -6,8 +6,12 @@ yarn-error.log*
 .git
 .gitignore
 .vscode
+.gcloud
 dist/**/*.map
 dist-server/**/*.map
 .env
 .env.*
 coverage
+release
+data
+public/images/samples

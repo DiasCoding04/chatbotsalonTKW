@@ -24,8 +24,8 @@ loadEnvFile()
 assertProductionEnv()
 
 const PORT =
-  Number(process.env.CONTEXT_CACHE_SERVER_PORT) ||
   Number(process.env.PORT) ||
+  Number(process.env.CONTEXT_CACHE_SERVER_PORT) ||
   8787
 const HOST = process.env.CONTEXT_CACHE_SERVER_HOST?.trim() || '0.0.0.0'
 const DEFAULT_TTL_S = Number(process.env.GEMINI_CONTEXT_CACHE_TTL_S) || 3600
@@ -54,11 +54,14 @@ const server = createServer((req, res) => {
     const url = requestUrl.pathname
 
     if (req.method === 'GET' && url === '/api/health') {
+      const geminiBackend = useVertexGeminiBackend() ? 'vertex' : 'developer'
       sendJson(res, 200, {
         ok: true,
         staticBuild: canServeStaticBuild(),
         contextEditTokenRequired: contextEditTokenRequired(),
         publicUrl: PUBLIC_URL || null,
+        geminiBackend,
+        geminiServerReady: geminiBackend === 'vertex' || Boolean(getServerGeminiApiKey()),
         geminiProxyKeyInjected: Boolean(getServerGeminiApiKey()),
       })
       return

@@ -9,6 +9,16 @@ export type ImageSamplesApiDocument = {
   updatedAt: string
 }
 
+export type HealthApiPayload = {
+  ok: boolean
+  staticBuild?: boolean
+  contextEditTokenRequired?: boolean
+  publicUrl?: string | null
+  geminiProxyKeyInjected?: boolean
+  geminiBackend?: 'vertex' | 'developer'
+  geminiServerReady?: boolean
+}
+
 const TOKEN_STORAGE_KEY = 'salon-context-editor-token'
 
 export function readStoredContextEditToken(): string {
@@ -69,4 +79,11 @@ export async function saveServerContext(
     throw new Error(body.error || `Không lưu được CONTEXT (${res.status}).`)
   }
   return body as ContextApiDocument
+}
+
+export async function fetchServerHealth(): Promise<HealthApiPayload | null> {
+  const res = await fetch('/api/health', { cache: 'no-store' })
+  if (res.status === 404) return null
+  if (!res.ok) return null
+  return (await res.json()) as HealthApiPayload
 }

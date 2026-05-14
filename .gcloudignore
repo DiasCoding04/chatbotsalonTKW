@@ -1,0 +1,33 @@
+# Exclude VCS and local tool state
+.git
+.gitignore
+.gcloud
+.vscode
+.idea
+
+# Dependencies and local artifacts
+node_modules/
+dist/
+dist-server/
+release/
+coverage/
+logs/
+*.log
+dev-vertex.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Local runtime/debug data
+data/
+
+# Local env and secrets
+.env
+.env.*
+*.local
+
+# Optional heavy static assets (rebuild/host separately if needed)
+public/images/samples/
+
