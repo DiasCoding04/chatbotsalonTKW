@@ -9,10 +9,8 @@ lerna-debug.log*
 
 node_modules
 dist-ssr
-dist-server
 *.local
 .env.*.local
-deploy/env/server.env
 data/facebook-token-vault.json
 
 # Bản dump debug webhook (PSID) — tạo khi FACEBOOK_WEBHOOK_LOG_RAW_BODY=1
