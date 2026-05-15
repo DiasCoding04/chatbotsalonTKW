@@ -1,6 +1,9 @@
 /** Salon: system prompt + catalog ảnh mẫu — dùng chung Training (browser) và inbox AI (server). */
 export const SALON_SYSTEM =
-  'Bạn là trợ lý ảo của một salon tóc. Trả lời ngắn gọn, lịch sự, tiếng Việt. ' +
+  'Bạn là chuyên viên tư vấn khách hàng tại salon tóc (xưng em/con theo ngữ cảnh). Trả lời ngắn gọn, lịch sự, tiếng Việt. ' +
+  'TUYỆT ĐỐI không để khách biết mình là AI, bot, trợ lý ảo, chatbot hay hệ thống tự động — luôn nói chuyện như nhân viên salon thật. ' +
+  'Không dùng các cụm đó trong tin gửi khách; nếu khách hỏi có phải robot/AI không thì khẳng định em là tư vấn viên salon đang hỗ trợ, không giải thích kỹ thuật. ' +
+  'TUYỆT ĐỐI không dùng từ "nhé" (cấm nhé chị, nhé em, nhé cô, nhé anh); chỉ dùng nha chị/nha em/nha cô/nha anh hoặc kết ạ. ' +
   'Giúp khách đặt lịch, tư vấn dịch vụ và giá theo ngữ cảnh được cung cấp bên dưới.'
 
 export type BranchPage = {
@@ -56,6 +59,9 @@ export type ImageSampleGroup = {
 
 export const IMAGE_SAMPLE_MARKER_RE = /\[\[\s*SEND_IMAGE\s*:\s*([a-z0-9_-]+)\s*\]\]/gi
 
+/** Giới hạn ảnh gửi mỗi nhóm mỗi lượt (Messenger gửi từng ảnh một tin). */
+export const DEFAULT_MAX_IMAGE_SAMPLES_PER_REPLY = 3
+
 export const IMAGE_SAMPLE_ALIASES: Record<string, string[]> = {
   moi_noi_long_vu: ['moi noi long vu', 'hinh moi noi', 'mau moi noi'],
   noi_toc: ['noi toc', 'mau noi toc', 'toc noi'],
@@ -91,14 +97,48 @@ export const IMAGE_SAMPLE_ALIASES: Record<string, string[]> = {
   nhuom_sang_khong_tay: ['nhuom sang khong can tay', 'mau sang khong tay', 'nhuom khong tay'],
 }
 
+/** Khách phàn nàn / từ chối ảnh, hoặc model hứa không gửi thêm — không được gửi ảnh mẫu. */
+export function shouldBlockImageSampleSend(...textParts: string[]): boolean {
+  const normalized = normalizeSearchText(textParts.filter(Boolean).join('\n'))
+  if (!normalized) return false
+
+  if (
+    /(khong gui them anh|khong gui anh nua|se khong gui.*anh|dung gui anh|thoi gui anh|xin loi.*gui anh|lam phien)/.test(
+      normalized,
+    )
+  ) {
+    return true
+  }
+  if (
+    /(gui anh nhieu|anh nhieu lan|spam anh|cung gui anh|cu gui anh|tai sao.*gui.*anh|vi sao.*gui.*anh)/.test(
+      normalized,
+    )
+  ) {
+    return true
+  }
+  return false
+}
+
 export function isExplicitImageSampleRequest(text: string): boolean {
+  if (shouldBlockImageSampleSend(text)) return false
+
   const lower = text.toLowerCase()
-  if (/(ảnh|hình|hinh|photo|image|tham khảo|tham khao|xem|gửi|gui|cho xem|có hình|co hinh|có ảnh|co anh)/i.test(lower)) {
+  if (
+    /(xem mẫu|xem mau|gửi mẫu|gui mau|gửi hình|gui hinh|cho xem mẫu|cho xem mau|muốn xem|muon xem|có hình mẫu|co hinh mau|tham khảo mẫu|tham khao mau)/i.test(
+      lower,
+    )
+  ) {
+    return true
+  }
+  if (/(tham khảo|tham khao|cho xem|có hình|co hinh|có ảnh|co anh)/i.test(lower)) {
     return true
   }
 
-  // Keep accents here: after normalization, "mẫu" and "màu" both become "mau".
-  return /\bmẫu\b/i.test(lower)
+  // "mẫu" alone — not when complaining (nhieu lan, spam, phiền).
+  if (/\bmẫu\b/i.test(lower) && !/(nhieu|lan|spam|phiền|phien|làm phiền)/i.test(lower)) {
+    return true
+  }
+  return false
 }
 
 function hasAnyWord(text: string, words: string[]): boolean {
@@ -291,6 +331,7 @@ export function buildImageSampleCatalogPrompt(groups: ImageSampleGroup[]): strin
     'Khi nhu cầu khách khớp rõ với đúng một nhóm ảnh, có thể chủ động thêm marker đúng nhóm ở một dòng riêng: [[SEND_IMAGE:key]].',
     'Không tự viết URL, không giải thích marker cho khách. App sẽ ẩn marker và thay bằng link ảnh thật.',
     'Dùng tối đa 1 marker/lượt; chỉ dùng khi chắc đúng loại tóc/dịch vụ/màu khách đang hỏi, nếu mơ hồ thì không gửi ảnh.',
+    'TUYỆT ĐỐI không dùng marker khi khách phàn nàn gửi ảnh nhiều/làm phiền, hoặc khi em đã nói sẽ không gửi thêm ảnh.',
     'Khi ngữ cảnh là phủ bạc / tóc bạc / hòa bạc / nuôi bạc, chỉ dùng nhuom_phu_bac, phu_bac_mau_tram hoặc toc_bac; tuyệt đối không dùng mau_tram.',
     'Các key ảnh mẫu:',
     ...groups.map((group) => `- ${group.key}: ${group.label} (${group.usage})`),
@@ -317,10 +358,11 @@ export function compactLines(text: string): string {
 }
 
 export function inferImageSampleKeys(text: string, groups: ImageSampleGroup[]): string[] {
+  if (!isExplicitImageSampleRequest(text)) return []
+
   const normalized = normalizeSearchText(text)
   const primaryKey = inferPrimaryImageSampleKey(text)
   if (primaryKey && groups.some((group) => group.key === primaryKey)) return [primaryKey]
-  if (!isExplicitImageSampleRequest(text)) return []
 
   const keys: string[] = []
   for (const group of groups) {
@@ -350,10 +392,24 @@ export function expandModelImageSampleMarkers(
   rawText: string,
   groups: ImageSampleGroup[],
   triggerText: string,
-  /** Inbox: tin khách có boilerplate "ảnh/…" làm bật `inferImageSampleKeys` nhầm — chỉ suy từ câu model. */
-  opts?: { inferImageKeysFromModelOnly?: boolean; imageBaseUrl?: string },
+  /** Inbox Facebook: không tự suy nhóm ảnh từ tin khách — chỉ gửi khi model có [[SEND_IMAGE:key]]. */
+  opts?: {
+    inferImageKeysFromModelOnly?: boolean
+    imageBaseUrl?: string
+    maxImagesPerGroup?: number
+  },
 ): { apiText: string; displayText: string; imageUrls: string[] } {
   const groupsByKey = new Map(groups.map((group) => [group.key, group]))
+  const maxPerGroup = Math.max(
+    1,
+    Math.min(8, opts?.maxImagesPerGroup ?? DEFAULT_MAX_IMAGE_SAMPLES_PER_REPLY),
+  )
+  const contextBlob = `${triggerText}\n${rawText}`
+  if (shouldBlockImageSampleSend(triggerText, rawText)) {
+    const cleanText = compactLines(rawText.replace(IMAGE_SAMPLE_MARKER_RE, ''))
+    return { apiText: cleanText, displayText: cleanText, imageUrls: [] }
+  }
+
   const markerKeys: string[] = []
   let hadMarker = false
   const textWithoutMarkers = rawText.replace(IMAGE_SAMPLE_MARKER_RE, (_marker, rawKey: string) => {
@@ -362,17 +418,16 @@ export function expandModelImageSampleMarkers(
     if (groupsByKey.has(key) && !markerKeys.includes(key)) markerKeys.push(key)
     return ''
   })
-  const allowedKeys = filterImageSampleKeysForContext(
-    inferImageSampleKeys(triggerText, groups),
-    triggerText,
+  const allowedKeys = opts?.inferImageKeysFromModelOnly
+    ? []
+    : filterImageSampleKeysForContext(inferImageSampleKeys(triggerText, groups), triggerText)
+  const validMarkerKeys = markerKeys.filter(
+    (key) => groupsByKey.has(key) && (!allowedKeys.length || allowedKeys.includes(key)),
   )
-  const validMarkerKeys = allowedKeys.length
-    ? markerKeys.filter((key) => allowedKeys.includes(key))
-    : []
-  const autoKeys = validMarkerKeys.length > 0 ? [] : allowedKeys
+  const autoKeys = markerKeys.length > 0 ? [] : allowedKeys
   const keys = filterImageSampleKeysForContext(
     [...validMarkerKeys, ...autoKeys].filter((key, index, arr) => arr.indexOf(key) === index),
-    `${triggerText}\n${rawText}`,
+    contextBlob,
   )
   if (!keys.length) {
     const cleanText = hadMarker ? compactLines(textWithoutMarkers) : rawText
@@ -387,18 +442,18 @@ export function expandModelImageSampleMarkers(
     const group = groupsByKey.get(key)
     if (!group) continue
     const resolvedUrls = group.urls
-      .slice(0, 8)
+      .slice(0, maxPerGroup)
       .map((u) => resolveImageSampleUrl(u, opts?.imageBaseUrl))
       .filter((u) => u.length > 0)
     displayAdditions.push([`Ảnh mẫu ${group.label}:`, ...resolvedUrls].join('\n'))
     for (const u of resolvedUrls) {
       const t = u.trim()
       if (!t || seenUrl.has(t)) continue
-      if (imageUrls.length >= 8) break
+      if (imageUrls.length >= maxPerGroup) break
       seenUrl.add(t)
       imageUrls.push(t)
     }
-    if (imageUrls.length >= 8) break
+    if (imageUrls.length >= maxPerGroup) break
   }
 
   return {

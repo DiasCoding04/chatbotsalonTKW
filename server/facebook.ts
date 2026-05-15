@@ -3,16 +3,27 @@ import { existsSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { extname, resolve, sep } from 'node:path'
+import { verifyContextEditToken } from './context-auth.ts'
 import { readJsonBody, readRawBody } from './request-body.ts'
-import { scheduleFacebookAiReplies } from './facebook-ai-reply.ts'
+import { scheduleFacebookAiReplies, type FacebookAiDeps } from './facebook-ai-reply.ts'
+import {
+  bootstrapFacebookTokensFromVault,
+  facebookTokenAutoRefreshEnabled,
+  fetchAllPageTokensFromUserToken,
+  pageTokenMapFromRows,
+  refreshFacebookPageTokensFromEnvUserToken,
+} from './facebook-token-refresh.ts'
+import { loadFacebookTokenVault } from './facebook-token-vault.ts'
 import {
   appendOutboundFacebookMessage,
   enrichFacebookConversationProfiles,
   type FacebookCustomerProfile,
   ingestFacebookWebhookPayload,
   listFacebookConversations,
+  listUnrepliedFacebookAiTargets,
   patchFacebookConversation,
   patchFacebookPage,
+  readFacebookStoreSnapshot,
   saveFacebookPages,
 } from './facebook-store.ts'
 
@@ -22,6 +33,9 @@ type FacebookStatus = {
   appSecret: boolean
   pageAccessToken: boolean
   pageTokenCount: number
+  tokenAutoRefresh: boolean
+  tokenVaultUpdatedAt?: string
+  tokenVaultLastMessage?: string
   verifyToken: boolean
   webhookUrl: string
   /** true khi FACEBOOK_WEBHOOK_LOG_RAW_BODY — log JSON ra stdout của process Node. */
@@ -47,10 +61,56 @@ type FacebookGraphCustomerProfile = {
   last_name?: string
   name?: string
   profile_pic?: string
+  picture?: { data?: { url?: string } }
 }
 
 const pageTokenCache = new Map<string, string>()
 const customerProfileCache = new Map<string, FacebookCustomerProfile>()
+let profileEnrichInFlight = false
+let unrepliedAiSweepTimer: ReturnType<typeof setInterval> | null = null
+let unrepliedAiSweepRunning = false
+let pageTokenRefreshTimer: ReturnType<typeof setInterval> | null = null
+
+function facebookAiReplyDeps(): FacebookAiDeps {
+  return {
+    getPageToken: getPageTokenForPage,
+    graphSendText: graphSendMessengerJson,
+    graphSendImageFromUrl: graphSendMessengerImageFromUrl,
+  }
+}
+
+function scheduleBackgroundProfileEnrichment(): void {
+  if (profileEnrichInFlight) return
+  profileEnrichInFlight = true
+  void (async () => {
+    try {
+      let total = 0
+      for (let round = 0; round < 15; round++) {
+        const n = await enrichFacebookConversationProfiles(fetchCustomerProfile, {
+          maxPerRun: 50,
+          concurrency: 8,
+        })
+        total += n
+        if (n === 0) break
+        await new Promise((r) => setTimeout(r, 150))
+      }
+      if (total > 0) console.log(`[facebook] background enriched ${total} customer profile field(s)`)
+    } catch (e) {
+      console.warn('[facebook] background profile enrich failed:', e)
+    } finally {
+      profileEnrichInFlight = false
+      try {
+        const store = await readFacebookStoreSnapshot()
+        const pending = store.conversations.filter((c) => !c.customerName || !c.avatarUrl).length
+        if (pending > 0) {
+          setTimeout(() => scheduleBackgroundProfileEnrichment(), 3000)
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  })()
+}
 
 function json(res: ServerResponse, status: number, body: unknown) {
   res.statusCode = status
@@ -76,6 +136,63 @@ function parseAllowedFacebookMediaUrl(raw: string): URL | null {
   }
 }
 
+export type AdCreativeMediaResult = {
+  imageUrl?: string
+  videoUrl?: string
+  permalinkUrl?: string
+}
+
+/** Lấy ảnh/video/permalink bài QC qua Graph (URL webhook thường hết hạn). */
+export async function resolveAdCreativeMedia(
+  pageId: string,
+  postId: string,
+): Promise<AdCreativeMediaResult> {
+  const token = await getPageTokenForPage(pageId)
+  if (!token) return {}
+
+  const url = new URL(`https://graph.facebook.com/v20.0/${postId}`)
+  url.searchParams.set(
+    'fields',
+    'full_picture,permalink_url,attachments{media_type,media{image{src},video{source}}}',
+  )
+  url.searchParams.set('access_token', token)
+  const res = await fetch(url).catch(() => null)
+  if (!res?.ok) {
+    return { permalinkUrl: `https://www.facebook.com/${pageId}/posts/${postId}` }
+  }
+
+  const body = (await res.json().catch(() => ({}))) as {
+    full_picture?: string
+    permalink_url?: string
+    attachments?: {
+      data?: Array<{
+        media_type?: string
+        media?: { image?: { src?: string }; video?: { source?: string } }
+      }>
+    }
+    error?: { message?: string }
+  }
+
+  let imageUrl = body.full_picture?.trim()
+  let videoUrl: string | undefined
+  for (const att of body.attachments?.data ?? []) {
+    const mt = (att.media_type || '').toLowerCase()
+    const img = att.media?.image?.src?.trim()
+    const vid = att.media?.video?.source?.trim()
+    if (mt === 'video' && vid) videoUrl = vid
+    if (img && !imageUrl) imageUrl = img
+  }
+
+  const permalinkUrl =
+    body.permalink_url?.trim() || `https://www.facebook.com/${pageId}/posts/${postId}`
+
+  return {
+    imageUrl: imageUrl || undefined,
+    videoUrl: videoUrl || undefined,
+    permalinkUrl,
+  }
+}
+
 async function handleFacebookCdnMediaProxy(res: ServerResponse, target: string): Promise<void> {
   const parsed = parseAllowedFacebookMediaUrl(target)
   if (!parsed || target.length > 8000) {
@@ -85,12 +202,18 @@ async function handleFacebookCdnMediaProxy(res: ServerResponse, target: string):
     return
   }
 
+  const host = parsed.hostname.toLowerCase()
+  const headers: Record<string, string> = {
+    Accept: 'image/*,video/*,*/*;q=0.8',
+    'User-Agent': 'Mozilla/5.0 (compatible; SalonInbox/1.0; +https://developers.facebook.com/)',
+  }
+  if (host.endsWith('fbsbx.com') || host.endsWith('facebook.com') || host.endsWith('fb.com')) {
+    headers.Referer = 'https://www.facebook.com/'
+  }
+
   const upstream = await fetch(parsed.toString(), {
     redirect: 'follow',
-    headers: {
-      Accept: 'image/*,video/*,*/*;q=0.8',
-      'User-Agent': 'Mozilla/5.0 (compatible; SalonInbox/1.0; +https://developers.facebook.com/)',
-    },
+    headers,
   }).catch(() => null)
 
   if (!upstream?.ok) {
@@ -110,6 +233,81 @@ async function handleFacebookCdnMediaProxy(res: ServerResponse, target: string):
 
 function envFlag(name: string): boolean {
   return Boolean(process.env[name]?.trim())
+}
+
+/**
+ * Quét định kỳ hội thoại tin cuối từ khách → xếp hàng AI trả lời (bù webhook miss / lỗi gửi).
+ * Tắt: FACEBOOK_AI_AUTO_REPLY=0 hoặc FACEBOOK_AI_UNREPLIED_SWEEP_MS=0
+ */
+function startFacebookPageTokenRefreshLoop(): void {
+  if (!facebookTokenAutoRefreshEnabled()) return
+  const hours = Number(process.env.FACEBOOK_TOKEN_REFRESH_INTERVAL_HOURS) || 6
+  const ms = Math.max(1, hours) * 60 * 60 * 1000
+  if (pageTokenRefreshTimer) clearInterval(pageTokenRefreshTimer)
+  pageTokenRefreshTimer = setInterval(() => {
+    void warmFacebookPageTokenCache().catch((e) =>
+      console.warn('[facebook] periodic token refresh failed:', e),
+    )
+  }, ms)
+  console.log(`[facebook] Tự làm mới page token mỗi ${hours}h (từ FACEBOOK_USER_ACCESS_TOKEN)`)
+}
+
+export function startFacebookAiUnrepliedSweep(): void {
+  void (async () => {
+    try {
+      await warmFacebookPageTokenCache()
+    } catch (e) {
+      console.warn('[facebook] warmFacebookPageTokenCache failed:', e)
+    }
+    startFacebookPageTokenRefreshLoop()
+
+    if (process.env.FACEBOOK_AI_AUTO_REPLY?.trim() === '0') {
+      console.log('[facebook-ai] sweep tắt (FACEBOOK_AI_AUTO_REPLY=0)')
+      return
+    }
+    const configured = Number(process.env.FACEBOOK_AI_UNREPLIED_SWEEP_MS)
+    if (configured === 0) {
+      console.log('[facebook-ai] sweep tắt (FACEBOOK_AI_UNREPLIED_SWEEP_MS=0)')
+      return
+    }
+    const sweepMs =
+      Number.isFinite(configured) && configured > 0 ? configured : 60_000
+    const minWaitMs = Math.max(
+      0,
+      Number(process.env.FACEBOOK_AI_UNREPLIED_MIN_WAIT_MS) || 8_000,
+    )
+
+    const runSweep = async (): Promise<void> => {
+    if (unrepliedAiSweepRunning) return
+    unrepliedAiSweepRunning = true
+    try {
+      const store = await readFacebookStoreSnapshot()
+      const now = Date.now()
+      const targets = listUnrepliedFacebookAiTargets(store).filter((t) => {
+        const conv = store.conversations.find((c) => c.id === t.conversationId)
+        const last = conv?.messages[conv.messages.length - 1]
+        if (!last) return false
+        const ts = Date.parse(last.timestamp)
+        if (!Number.isFinite(ts)) return true
+        return now - ts >= minWaitMs
+      })
+      if (!targets.length) return
+      console.log(`[facebook-ai] sweep: ${targets.length} hội thoại chưa trả lời`)
+      await scheduleFacebookAiReplies(targets, facebookAiReplyDeps())
+    } catch (e) {
+      console.warn('[facebook-ai] sweep failed:', e)
+    } finally {
+      unrepliedAiSweepRunning = false
+    }
+  }
+
+    await runSweep()
+    if (unrepliedAiSweepTimer) clearInterval(unrepliedAiSweepTimer)
+    unrepliedAiSweepTimer = setInterval(() => void runSweep(), sweepMs)
+    console.log(
+      `[facebook-ai] sweep bật: mỗi ${sweepMs}ms, chờ tối thiểu ${minWaitMs}ms sau tin khách`,
+    )
+  })().catch((e) => console.warn('[facebook-ai] bootstrap failed:', e))
 }
 
 /** Ghi data/facebook-webhook-last.json mỗi webhook (tắt: FACEBOOK_WEBHOOK_NO_DEBUG_FILE=1). Không phụ thuộc NODE_ENV. */
@@ -155,14 +353,31 @@ export function readFacebookPageTokens(): string[] {
   )
 }
 
+async function probePageAccessToken(pageId: string, token: string): Promise<boolean> {
+  const url = new URL(`https://graph.facebook.com/v20.0/${encodeURIComponent(pageId)}`)
+  url.searchParams.set('fields', 'id')
+  url.searchParams.set('access_token', token)
+  const res = await fetch(url).catch(() => null)
+  if (!res?.ok) return false
+  const body = (await res.json().catch(() => ({}))) as { id?: string }
+  return body.id === pageId
+}
+
 async function fetchFacebookPagesFromTokens(): Promise<FacebookGraphPage[]> {
   const pages: FacebookGraphPage[] = []
-  for (const token of readFacebookPageTokens()) {
+  const tokens = readFacebookPageTokens()
+  for (const token of tokens) {
     const url = new URL('https://graph.facebook.com/v20.0/me')
     url.searchParams.set('fields', 'id,name,picture.type(large)')
     url.searchParams.set('access_token', token)
     const res = await fetch(url).catch(() => null)
-    if (!res?.ok) continue
+    if (!res?.ok) {
+      const errText = (await res?.text().catch(() => '')) ?? ''
+      console.warn(
+        `[facebook] Page token /me failed (${res?.status ?? 'network'}): ${errText.slice(0, 200)}`,
+      )
+      continue
+    }
     const page = (await res.json()) as FacebookGraphPage
     if (page.id) {
       pageTokenCache.set(page.id, token)
@@ -172,11 +387,59 @@ async function fetchFacebookPagesFromTokens(): Promise<FacebookGraphPage[]> {
   return Array.from(new Map(pages.map((page) => [page.id, page])).values())
 }
 
+/** Gọi lúc khởi động — map page id ↔ token, log fanpage thiếu token. */
+export async function warmFacebookPageTokenCache(): Promise<void> {
+  pageTokenCache.clear()
+  await bootstrapFacebookTokensFromVault()
+  const vaultBoot = await loadFacebookTokenVault()
+  if (vaultBoot?.pageTokens) {
+    for (const [id, token] of Object.entries(vaultBoot.pageTokens)) {
+      const t = token?.trim()
+      if (id && t) pageTokenCache.set(id, t)
+    }
+  }
+  if (facebookTokenAutoRefreshEnabled()) {
+    const refreshed = await refreshFacebookPageTokensFromEnvUserToken()
+    console.log(`[facebook] ${refreshed.message}`)
+    if (refreshed.ok) {
+      const userToken = process.env.FACEBOOK_USER_ACCESS_TOKEN?.trim()
+      if (userToken) {
+        const rows = await fetchAllPageTokensFromUserToken(userToken)
+        for (const [id, token] of pageTokenMapFromRows(rows)) {
+          pageTokenCache.set(id, token)
+        }
+      }
+    }
+  }
+  const pages = await fetchFacebookPagesFromTokens()
+  const ids = pages.map((p) => p.id).filter(Boolean)
+  console.log(
+    `[facebook] Page token cache: ${ids.length} fanpage (${ids.join(', ') || 'trống — kiểm tra FACEBOOK_PAGE_ACCESS_TOKEN(S)'})`,
+  )
+}
+
 async function getPageTokenForPage(pageId: string): Promise<string | null> {
   const cached = pageTokenCache.get(pageId)
   if (cached) return cached
+
   await fetchFacebookPagesFromTokens()
-  return pageTokenCache.get(pageId) ?? null
+  const afterMe = pageTokenCache.get(pageId)
+  if (afterMe) return afterMe
+
+  for (const token of readFacebookPageTokens()) {
+    if (pageTokenCache.has(pageId)) break
+    const ok = await probePageAccessToken(pageId, token)
+    if (ok) {
+      pageTokenCache.set(pageId, token)
+      console.log(`[facebook] Mapped page ${pageId} → token (probe)`)
+      return token
+    }
+  }
+
+  console.warn(
+    `[facebook] Không có page token cho ${pageId}. Các page đã map: ${[...pageTokenCache.keys()].join(', ') || '(trống)'}`,
+  )
+  return null
 }
 
 type GraphAttachmentRow = { file_url?: string; mime_type?: string }
@@ -270,30 +533,189 @@ async function fetchCustomerProfile(
   if (!token) return null
 
   const url = new URL(`https://graph.facebook.com/v20.0/${customerPsid}`)
-  url.searchParams.set('fields', 'first_name,last_name,name,profile_pic')
+  url.searchParams.set('fields', 'first_name,last_name,name,profile_pic,picture.type(large)')
   url.searchParams.set('access_token', token)
   const res = await fetch(url).catch(() => null)
-  if (!res?.ok) return null
+  if (!res?.ok) {
+    if (envFlag('FACEBOOK_WEBHOOK_DEBUG_GRAPH')) {
+      const errText = (await res?.text().catch(() => '')) ?? ''
+      console.warn(`[facebook] profile ${customerPsid} page ${pageId} → ${res?.status} ${errText.slice(0, 300)}`)
+    }
+    return null
+  }
 
   const profile = (await res.json()) as FacebookGraphCustomerProfile
   const name =
     profile.name?.trim() ||
     [profile.first_name, profile.last_name].filter(Boolean).join(' ').trim() ||
     undefined
-  const normalized = {
-    name,
-    avatarUrl: profile.profile_pic,
-  }
-  customerProfileCache.set(cacheKey, normalized)
+  const avatarUrl = profile.profile_pic?.trim() || profile.picture?.data?.url?.trim() || undefined
+  const normalized = { name, avatarUrl }
+  if (name || avatarUrl) customerProfileCache.set(cacheKey, normalized)
   return normalized
 }
 
-export function getFacebookStatus(): FacebookStatus {
+export type CustomerProfileDiagnosis = {
+  conversationId: string
+  pageId: string
+  customerPsid: string
+  store: {
+    customerName?: string
+    avatarUrl?: string
+    hasName: boolean
+    hasAvatar: boolean
+  }
+  pageToken: { found: boolean }
+  graph: {
+    httpStatus: number | null
+    error?: { message?: string; type?: string; code?: number; error_subcode?: number }
+    name?: string
+    avatarUrl?: string
+  }
+  resolvedProfile: FacebookCustomerProfile | null
+  cause: string
+  hint: string
+}
+
+/** Chẩn đoán vì sao không có tên/avatar khách (dùng token CONTEXT_EDITOR_TOKEN). */
+export async function diagnoseCustomerProfile(
+  pageId: string,
+  customerPsid: string,
+): Promise<CustomerProfileDiagnosis> {
+  const conversationId = `${pageId}:${customerPsid}`
+  const store = await readFacebookStoreSnapshot()
+  const conv = store.conversations.find((c) => c.id === conversationId)
+  const storeSlice = {
+    customerName: conv?.customerName,
+    avatarUrl: conv?.avatarUrl,
+    hasName: Boolean(conv?.customerName?.trim()),
+    hasAvatar: Boolean(conv?.avatarUrl?.trim()),
+  }
+
+  const token = await getPageTokenForPage(pageId)
+  if (!token) {
+    return {
+      conversationId,
+      pageId,
+      customerPsid,
+      store: storeSlice,
+      pageToken: { found: false },
+      graph: { httpStatus: null },
+      resolvedProfile: null,
+      cause: 'NO_PAGE_TOKEN',
+      hint: 'Không có page access token cho fanpage này. Thêm token page vào FACEBOOK_PAGE_ACCESS_TOKENS (đúng page id) rồi deploy.',
+    }
+  }
+
+  const url = new URL(`https://graph.facebook.com/v20.0/${customerPsid}`)
+  url.searchParams.set('fields', 'first_name,last_name,name,profile_pic,picture.type(large)')
+  url.searchParams.set('access_token', token)
+  const res = await fetch(url).catch(() => null)
+  if (!res) {
+    return {
+      conversationId,
+      pageId,
+      customerPsid,
+      store: storeSlice,
+      pageToken: { found: true },
+      graph: { httpStatus: null },
+      resolvedProfile: null,
+      cause: 'GRAPH_NETWORK',
+      hint: 'Server không gọi được graph.facebook.com (mạng/DNS/firewall).',
+    }
+  }
+
+  const raw = (await res.json().catch(() => ({}))) as FacebookGraphCustomerProfile & {
+    error?: { message?: string; type?: string; code?: number; error_subcode?: number }
+  }
+
+  if (!res.ok) {
+    const err = raw.error
+    const code = err?.code
+    let cause = 'GRAPH_ERROR'
+    let hint = err?.message || `Graph HTTP ${res.status}`
+    if (code === 190) {
+      cause = 'TOKEN_INVALID'
+      hint = 'Page access token hết hạn hoặc bị thu hồi. Lấy token mới từ Meta và cập nhật env.'
+    } else if (code === 10 || code === 200 || res.status === 403) {
+      cause = 'PERMISSION_OR_POLICY'
+      hint =
+        'App thiếu quyền hoặc Meta chặn User Profile (pages_messaging + Advanced Access). Khách phải đã nhắn page trong 24h (hoặc theo policy hiện tại).'
+    } else if (code === 100 || code === 803) {
+      cause = 'INVALID_PSID'
+      hint = 'PSID không hợp lệ hoặc không thuộc fanpage này.'
+    }
+    return {
+      conversationId,
+      pageId,
+      customerPsid,
+      store: storeSlice,
+      pageToken: { found: true },
+      graph: { httpStatus: res.status, error: err },
+      resolvedProfile: null,
+      cause,
+      hint,
+    }
+  }
+
+  const name =
+    raw.name?.trim() ||
+    [raw.first_name, raw.last_name].filter(Boolean).join(' ').trim() ||
+    undefined
+  const avatarUrl = raw.profile_pic?.trim() || raw.picture?.data?.url?.trim() || undefined
+  const resolvedProfile = { name, avatarUrl }
+
+  if (!name && !avatarUrl) {
+    return {
+      conversationId,
+      pageId,
+      customerPsid,
+      store: storeSlice,
+      pageToken: { found: true },
+      graph: { httpStatus: res.status, name, avatarUrl },
+      resolvedProfile: null,
+      cause: 'GRAPH_EMPTY_PROFILE',
+      hint:
+        'Graph trả 200 nhưng không có name/profile_pic — thường do khách chưa đủ điều kiện hiển thị profile hoặc app chưa được Meta duyệt quyền profile.',
+    }
+  }
+
+  if (storeSlice.hasName && storeSlice.hasAvatar) {
+    return {
+      conversationId,
+      pageId,
+      customerPsid,
+      store: storeSlice,
+      pageToken: { found: true },
+      graph: { httpStatus: res.status, name, avatarUrl },
+      resolvedProfile,
+      cause: 'STORE_OK_CHECK_UI',
+      hint:
+        'Firestore đã có tên + avatar. Nếu UI vẫn “Khách xxx”: hard refresh, kiểm tra proxy ảnh /api/facebook/cdn-media?u=...',
+    }
+  }
+
+  return {
+    conversationId,
+    pageId,
+    customerPsid,
+    store: storeSlice,
+    pageToken: { found: true },
+    graph: { httpStatus: res.status, name, avatarUrl },
+    resolvedProfile,
+    cause: 'GRAPH_OK_STORE_NOT_SAVED',
+    hint:
+      'Graph có dữ liệu nhưng store chưa lưu — đợi enrich nền (poll inbox) hoặc gọi lại GET /api/facebook/conversations. Nếu vẫn trống: kiểm tra quyền ghi Firestore.',
+  }
+}
+
+export async function getFacebookStatus(): Promise<FacebookStatus> {
   const appId = envFlag('FACEBOOK_APP_ID')
   const appSecret = envFlag('FACEBOOK_APP_SECRET')
   const pageTokenCount = readFacebookPageTokens().length
   const pageAccessToken = pageTokenCount > 0
   const verifyToken = envFlag('FACEBOOK_VERIFY_TOKEN')
+  const vault = await loadFacebookTokenVault().catch(() => null)
   const publicUrl =
     process.env.FACEBOOK_WEBHOOK_PUBLIC_URL?.trim() || process.env.APP_PUBLIC_URL?.trim()
   return {
@@ -302,6 +724,9 @@ export function getFacebookStatus(): FacebookStatus {
     appSecret,
     pageAccessToken,
     pageTokenCount,
+    tokenAutoRefresh: facebookTokenAutoRefreshEnabled(),
+    tokenVaultUpdatedAt: vault?.updatedAt,
+    tokenVaultLastMessage: vault?.lastRefreshMessage,
     verifyToken,
     webhookUrl: publicUrl ? `${publicUrl.replace(/\/$/, '')}/api/facebook/webhook` : '/api/facebook/webhook',
     webhookLogRawBody: envFlag('FACEBOOK_WEBHOOK_LOG_RAW_BODY'),
@@ -460,7 +885,7 @@ async function graphSendMessengerImageFromUrl(
 }
 
 async function handleFacebookSendMessage(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const cfg = getFacebookStatus()
+  const cfg = await getFacebookStatus()
   if (!cfg.configured) {
     json(res, 400, { ok: false, error: 'Thiếu cấu hình Facebook (App ID, Secret, Page token, Verify token).' })
     return
@@ -507,7 +932,7 @@ async function handleFacebookSendMessage(req: IncomingMessage, res: ServerRespon
       customerPsid: recipientPsid,
       message: {
         id: messageId,
-        author: 'page',
+        author: 'staff',
         text: msgText,
         timestamp: new Date().toISOString(),
         isEcho: true,
@@ -551,12 +976,12 @@ export async function handleFacebookApi(req: IncomingMessage, res: ServerRespons
   if (!url.pathname.startsWith('/api/facebook')) return false
 
   if (req.method === 'GET' && url.pathname === '/api/facebook/status') {
-    json(res, 200, getFacebookStatus())
+    json(res, 200, await getFacebookStatus())
     return true
   }
 
   if (req.method === 'GET' && url.pathname === '/api/facebook/conversations') {
-    await enrichFacebookConversationProfiles(fetchCustomerProfile)
+    scheduleBackgroundProfileEnrichment()
     json(res, 200, await listFacebookConversations())
     return true
   }
@@ -573,8 +998,50 @@ export async function handleFacebookApi(req: IncomingMessage, res: ServerRespons
     return true
   }
 
+  if (req.method === 'GET' && url.pathname === '/api/facebook/ad-creative') {
+    const pageId = url.searchParams.get('pageId')?.trim() ?? ''
+    const postId = url.searchParams.get('postId')?.trim() ?? ''
+    if (!pageId || !postId) {
+      json(res, 400, { ok: false, error: 'Cần query pageId và postId.' })
+      return true
+    }
+    try {
+      const media = await resolveAdCreativeMedia(pageId, postId)
+      json(res, 200, { ok: true, ...media })
+    } catch (e) {
+      json(res, 500, {
+        ok: false,
+        error: e instanceof Error ? e.message : String(e),
+      })
+    }
+    return true
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/facebook/debug-customer-profile') {
+    if (!verifyContextEditToken(req)) {
+      json(res, 401, { ok: false, error: 'Thiếu hoặc sai X-Context-Edit-Token / Authorization Bearer.' })
+      return true
+    }
+    const pageId = url.searchParams.get('pageId')?.trim() ?? ''
+    const psid = url.searchParams.get('psid')?.trim() ?? url.searchParams.get('customerPsid')?.trim() ?? ''
+    if (!pageId || !psid) {
+      json(res, 400, {
+        ok: false,
+        error: 'Cần query pageId và psid (hoặc customerPsid). conversationId = pageId:psid.',
+      })
+      return true
+    }
+    try {
+      const diagnosis = await diagnoseCustomerProfile(pageId, psid)
+      json(res, 200, { ok: true, ...diagnosis })
+    } catch (e) {
+      json(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) })
+    }
+    return true
+  }
+
   if (req.method === 'POST' && url.pathname === '/api/facebook/sync') {
-    const status = getFacebookStatus()
+    const status = await getFacebookStatus()
     if (!status.configured) {
       json(res, 200, {
         ok: false,
@@ -595,6 +1062,8 @@ export async function handleFacebookApi(req: IncomingMessage, res: ServerRespons
           connected: true,
         })),
     )
+
+    scheduleBackgroundProfileEnrichment()
 
     json(res, 200, {
       ok: true,
@@ -661,12 +1130,30 @@ export async function handleFacebookApi(req: IncomingMessage, res: ServerRespons
       stored,
     })
     if (stored.pendingAiReplies.length) {
-      void scheduleFacebookAiReplies(stored.pendingAiReplies, {
-        getPageToken: getPageTokenForPage,
-        graphSendText: graphSendMessengerJson,
-        graphSendImageFromUrl: graphSendMessengerImageFromUrl,
-      }).catch((e) => console.warn('[facebook-ai]', e))
+      void scheduleFacebookAiReplies(stored.pendingAiReplies, facebookAiReplyDeps()).catch((e) =>
+        console.warn('[facebook-ai]', e),
+      )
     }
+    if (stored.conversationsTouched > 0) {
+      scheduleBackgroundProfileEnrichment()
+    }
+    return true
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/facebook/enrich-profiles') {
+    if (!verifyContextEditToken(req)) {
+      json(res, 401, { ok: false, error: 'Thiếu hoặc sai X-Context-Edit-Token / Authorization Bearer.' })
+      return true
+    }
+    scheduleBackgroundProfileEnrichment()
+    const store = await readFacebookStoreSnapshot()
+    const pending = store.conversations.filter((c) => !c.customerName || !c.avatarUrl).length
+    json(res, 200, {
+      ok: true,
+      message: 'Đang enrich profile khách nền (lặp đến khi hết hoặc Graph không trả thêm).',
+      pendingProfiles: pending,
+      totalConversations: store.conversations.length,
+    })
     return true
   }
 

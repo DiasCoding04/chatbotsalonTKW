@@ -68,8 +68,14 @@ export async function readImageSamplesDocument(): Promise<ContextDocument> {
   }
 }
 
+/** Ghi CONTEXT chính (data/) và mirror sang public/CONTEXT.md để GET tĩnh + seed container khớp bản mới nhất. */
 export async function writeContextDocument(content: string): Promise<ContextDocument> {
   await ensureContextFile()
   await writeFile(CONTEXT_FILE, content, 'utf8')
+  try {
+    await writeFile(SEED_FILE, content, 'utf8')
+  } catch (e) {
+    console.warn('[context-store] Không ghi mirror public/CONTEXT.md:', e)
+  }
   return readContextDocument()
 }

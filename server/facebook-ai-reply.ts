@@ -3,8 +3,13 @@
  * Vertex: cùng biến môi trường như Training — GEMINI_BACKEND=vertex + GOOGLE_APPLICATION_CREDENTIALS
  * (hoặc VERTEX_SERVICE_ACCOUNT_JSON) + VERTEX_AI_PROJECT_ID (+ VERTEX_AI_LOCATION / VERTEX_AI_MODEL).
  */
-import { ensureSharedContextCache, evictSharedContextCache } from './context-cache-store.ts'
+import { resolveGeminiContextCacheTtlSeconds } from './context-cache-ttl.ts'
+import {
+  ensureSharedContextCache,
+  evictSharedContextCacheAndDeleteRemote,
+} from './context-cache-store.ts'
 import { readContextDocument, readImageSamplesDocument } from './context-store.ts'
+import { isSalonOutboundAuthor, registerAiOutboundMessageId } from './facebook-message-author.ts'
 import {
   appendOutboundFacebookMessage,
   applyFacebookConversationAiUsage,
@@ -289,6 +294,10 @@ function recentUserTurnsPlainText(history: ChatTurn[], maxTurns = 4): string {
   return lines.join('\n')
 }
 
+/** Khi model/marker không còn nội dung gửi được — tránh im lặng với khách. */
+const FACEBOOK_AI_EMPTY_REPLY_FALLBACK =
+  'Dạ em nhận tin của chị rồi ạ, em tư vấn lại cho mình ngay nha chị'
+
 /** Mỗi dòng non-empty = 1 tin Messenger riêng (giới hạn độ dài 1 tin). */
 function splitAiReplyIntoFacebookMessages(text: string): string[] {
   return text
@@ -329,7 +338,7 @@ function storedMessagesToPartialTurns(
   conv: {
     messages: Array<{
       id: string
-      author: 'customer' | 'page' | 'system'
+      author: string
       text: string
       images?: string[]
       videos?: string[]
@@ -374,7 +383,7 @@ function storedMessagesToPartialTurns(
       if (!t && !imageUrls.length) continue
 
       out.push({ role: 'user', text: t || '(tin nhắn)', imageUrls, attachImagePayload })
-    } else if (m.author === 'page' || m.author === 'system') {
+    } else if (isSalonOutboundAuthor(m.author)) {
       const t = m.text.trim()
       if (t) out.push({ role: 'model', text: t })
     }
@@ -384,7 +393,7 @@ function storedMessagesToPartialTurns(
 
 function hasCountableTextMessage(message: {
   text: string
-  author: 'customer' | 'page' | 'system'
+  author: string
 }): boolean {
   const text = message.text.trim()
   if (!text) return false
@@ -395,7 +404,7 @@ function hasCountableTextMessage(message: {
 function selectAiHistoryMessages(
   messages: Array<{
     id: string
-    author: 'customer' | 'page' | 'system'
+    author: string
     text: string
     images?: string[]
     videos?: string[]
@@ -405,7 +414,7 @@ function selectAiHistoryMessages(
   maxTextMessages: number,
 ): Array<{
   id: string
-  author: 'customer' | 'page' | 'system'
+  author: string
   text: string
   images?: string[]
   videos?: string[]
@@ -413,7 +422,7 @@ function selectAiHistoryMessages(
 }> {
   const picked: Array<{
     id: string
-    author: 'customer' | 'page' | 'system'
+    author: string
     text: string
     images?: string[]
     videos?: string[]
@@ -480,7 +489,7 @@ async function executeFacebookAiReply(
         : inferredBranch
     const systemPrompt = buildSalonSystemPrompt(mergedContext, branch)
 
-    const ttl = Number(process.env.GEMINI_CONTEXT_CACHE_TTL_S) || 3600
+    const ttl = resolveGeminiContextCacheTtlSeconds()
     const model = resolveGeminiModelId()
 
     const msgSlice = selectAiHistoryMessages(
@@ -510,7 +519,7 @@ async function executeFacebookAiReply(
         lastErr = e
         const msg = e instanceof Error ? e.message : String(e)
         if (attempt < 3 && looksLikeStaleContextCacheError(msg)) {
-          evictSharedContextCache(model, systemPrompt)
+          await evictSharedContextCacheAndDeleteRemote(apiKey, model, systemPrompt)
           await new Promise((r) => setTimeout(r, 250 * (attempt + 1)))
           continue
         }
@@ -519,37 +528,53 @@ async function executeFacebookAiReply(
     }
     if (raw == null) throw lastErr instanceof Error ? lastErr : new Error(String(lastErr))
 
-    const tariff = getTariff(model)
-    let addUsd = 0
-    let contextCacheHit = false
-    if (tariff && lastGenUsage) {
-      const m = lastGenUsage
-      addUsd = estimateUsd(
-        tariff,
-        m.promptTokenCount ?? 0,
-        m.cachedContentTokenCount ?? 0,
-        m.candidatesTokenCount ?? 0,
-      ).totalUsd
-      contextCacheHit = (m.cachedContentTokenCount ?? 0) > 0
-    }
-    await applyFacebookConversationAiUsage({
-      conversationId: target.conversationId,
-      addUsd,
-      contextCacheHit,
-    })
-
     const recentUserText = recentUserTurnsPlainText(history)
     const expanded = expandModelImageSampleMarkers(raw, groups, recentUserText, {
       inferImageKeysFromModelOnly: true,
       imageBaseUrl: IMAGE_SAMPLES_BASE_URL,
+      maxImagesPerGroup: 3,
     })
-    const chunks = splitAiReplyIntoFacebookMessages(expanded.apiText.trim())
-    const imageUrls = expanded.imageUrls
-    if (!chunks.length && !imageUrls.length) return
+    let chunks = splitAiReplyIntoFacebookMessages(expanded.apiText.trim())
+    const imageUrls = expanded.imageUrls.filter((u) => /^https?:\/\//i.test(u.trim()))
+    if (
+      expanded.imageUrls.length > 0 &&
+      imageUrls.length === 0 &&
+      !IMAGE_SAMPLES_BASE_URL
+    ) {
+      console.warn(
+        '[facebook-ai]',
+        target.conversationId,
+        'Có marker ảnh nhưng thiếu IMAGE_SAMPLES_BASE_URL — không gửi được ảnh mẫu.',
+      )
+    }
+    if (!chunks.length && !imageUrls.length) {
+      console.warn(
+        '[facebook-ai]',
+        target.conversationId,
+        'Model trả lời rỗng sau xử lý marker — dùng tin dự phòng.',
+        { rawPreview: raw.slice(0, 120) },
+      )
+      chunks = [FACEBOOK_AI_EMPTY_REPLY_FALLBACK]
+    }
+
+    const storeNow = await readFacebookStoreSnapshot()
+    const convNow = storeNow.conversations.find((c) => c.id === target.conversationId)
+    const latestCustomerNow = convNow?.messages
+      ? [...convNow.messages].reverse().find((m) => m.author === 'customer')
+      : undefined
+    if (!latestCustomerNow || latestCustomerNow.id !== last.id) {
+      console.warn(
+        '[facebook-ai]',
+        target.conversationId,
+        'Khách đã gửi tin mới — bỏ gửi lượt AI cũ (không cộng chi phí inbox).',
+      )
+      return
+    }
 
     const token = await deps.getPageToken(target.pageId)
     if (!token) throw new Error('Không có page token')
 
+    let deliveredCount = 0
     let gapBeforeNext = false
     for (let i = 0; i < chunks.length; i++) {
       if (gapBeforeNext) await new Promise((r) => setTimeout(r, 150))
@@ -559,17 +584,19 @@ async function executeFacebookAiReply(
       if (r.error?.message || !r.message_id) {
         throw new Error(r.error?.message || 'Graph không trả message_id')
       }
+      registerAiOutboundMessageId(r.message_id)
       const ts = new Date().toISOString()
       await appendOutboundFacebookMessage({
         pageId: target.pageId,
         customerPsid: target.customerPsid,
         message: {
           id: r.message_id,
-          author: 'system',
+          author: 'ai',
           text: piece,
           timestamp: ts,
         },
       })
+      deliveredCount += 1
     }
 
     for (const rawImg of imageUrls) {
@@ -579,6 +606,7 @@ async function executeFacebookAiReply(
       if (r.error?.message || !r.message_id) {
         throw new Error(r.error?.message || 'Graph không trả message_id (ảnh)')
       }
+      registerAiOutboundMessageId(r.message_id)
       const ts = new Date().toISOString()
       const trimmed = rawImg.trim()
       const storedImg =
@@ -588,12 +616,36 @@ async function executeFacebookAiReply(
         customerPsid: target.customerPsid,
         message: {
           id: r.message_id,
-          author: 'system',
+          author: 'ai',
           text: '',
           timestamp: ts,
           images: [storedImg],
         },
       })
+      deliveredCount += 1
+    }
+
+    if (deliveredCount > 0) {
+      const tariff = getTariff(model)
+      let addUsd = 0
+      let contextCacheHit = false
+      if (tariff && lastGenUsage) {
+        const m = lastGenUsage
+        addUsd = estimateUsd(
+          tariff,
+          m.promptTokenCount ?? 0,
+          m.cachedContentTokenCount ?? 0,
+          m.candidatesTokenCount ?? 0,
+        ).totalUsd
+        contextCacheHit = (m.cachedContentTokenCount ?? 0) > 0
+      }
+      await applyFacebookConversationAiUsage({
+        conversationId: target.conversationId,
+        addUsd,
+        contextCacheHit,
+      })
+    } else {
+      console.warn('[facebook-ai]', target.conversationId, 'Không gửi được tin nào — không cộng chi phí inbox.')
     }
   } catch (e) {
     console.warn('[facebook-ai]', target.conversationId, e)

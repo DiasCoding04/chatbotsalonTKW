@@ -36,6 +36,21 @@ export function writeSharedContextCacheRecord(record: SharedContextCacheRecord):
   localStorage.setItem(SHARED_CONTEXT_CACHE_STORAGE_KEY, JSON.stringify(record))
 }
 
+/** Sau khi PUT /api/context — fingerprint đổi; xóa cache cũ trên trình duyệt. */
+export function clearBrowserSharedContextCache(): void {
+  try {
+    localStorage.removeItem(SHARED_CONTEXT_CACHE_STORAGE_KEY)
+  } catch {
+    /* ignore */
+  }
+}
+
+function defaultBrowserContextCacheTtlSeconds(): number {
+  const v = Number(import.meta.env.VITE_GEMINI_CONTEXT_CACHE_TTL_S)
+  if (Number.isFinite(v) && v > 0) return Math.floor(v)
+  return import.meta.env.DEV ? 900 : 3600
+}
+
 export function isSharedContextCacheValid(
   record: SharedContextCacheRecord,
   fingerprint: string,
@@ -55,8 +70,9 @@ async function resolveBrowserSharedContextCache(
   apiKey: string,
   model: string,
   systemPrompt: string,
-  ttlSeconds: number,
+  ttlSeconds?: number,
 ): Promise<{ name: string; reused: boolean }> {
+  const ttl = ttlSeconds ?? defaultBrowserContextCacheTtlSeconds()
   const fingerprint = buildContextCacheFingerprint(model, systemPrompt)
   const now = Date.now()
   const existing = readSharedContextCacheRecord()
@@ -70,8 +86,8 @@ async function resolveBrowserSharedContextCache(
       return { name: again.name, reused: true }
     }
 
-    const info = await createCachedContentWithRetry(apiKey, model, systemPrompt, ttlSeconds)
-    let expireAt = now + ttlSeconds * 1000
+    const info = await createCachedContentWithRetry(apiKey, model, systemPrompt, ttl)
+    let expireAt = now + ttl * 1000
     if (info.expireTime) {
       const parsed = Date.parse(info.expireTime)
       if (Number.isFinite(parsed)) expireAt = parsed
@@ -84,12 +100,16 @@ async function resolveBrowserSharedContextCache(
 async function resolveServerSharedContextCache(
   model: string,
   systemPrompt: string,
-  ttlSeconds: number,
+  ttlSeconds?: number,
 ): Promise<{ name: string; reused: boolean }> {
+  const payload: Record<string, unknown> = { model, systemPrompt }
+  if (ttlSeconds != null && Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+    payload.ttlSeconds = ttlSeconds
+  }
   const res = await fetch('/api/context-cache/ensure', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model, systemPrompt, ttlSeconds }),
+    body: JSON.stringify(payload),
   })
   const raw = await res.text()
   if (!res.ok) {
@@ -105,7 +125,7 @@ export async function resolveSharedContextCache(
   apiKey: string,
   model: string,
   systemPrompt: string,
-  ttlSeconds: number,
+  ttlSeconds?: number,
 ): Promise<{ name: string; reused: boolean }> {
   if (getContextCacheScope() === 'browser') {
     return resolveBrowserSharedContextCache(apiKey, model, systemPrompt, ttlSeconds)

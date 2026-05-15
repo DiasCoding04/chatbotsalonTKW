@@ -2,6 +2,13 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { clearVertexAccessTokenCache, getVertexAccessToken } from './vertex-auth.ts'
 import {
+  isStoredAiMessageId,
+  normalizeStoredMessageAuthor,
+  rememberAiMessageId,
+  registerAiOutboundMessageId,
+  type FacebookMessageAuthor,
+} from './facebook-message-author.ts'
+import {
   BRANCH_PAGES,
   isSalonPlaceholderMessageText,
   PLACEHOLDER_NO_TEXT,
@@ -33,6 +40,8 @@ export type FacebookAdAttribution = {
   /** Creative preview from ads_context_data */
   photoUrl?: string
   videoUrl?: string
+  /** Bài đăng gốc của QC — dùng mở trên Facebook / Graph lấy media mới */
+  postId?: string
   raw?: unknown
 }
 
@@ -49,7 +58,8 @@ export type FacebookPageRecord = {
 
 export type FacebookStoredMessage = {
   id: string
-  author: 'customer' | 'page' | 'system'
+  /** `ai` = bot; `staff` = người/fanpage (composer, Business Suite); legacy `page`/`system` được chuẩn hóa khi đọc. */
+  author: 'customer' | 'ai' | 'staff' | 'page' | 'system'
   text: string
   timestamp: string
   isEcho?: boolean
@@ -84,6 +94,8 @@ export type FacebookStoredConversation = {
   /** Lần gọi AI gần nhất: response có đọc token từ Context Cache không. */
   aiLastContextCacheHit?: boolean
   aiLastRunAt?: string
+  /** message_id Graph do AI gửi — nhận diện echo webhook / sửa author cũ. */
+  aiMessageIds?: string[]
 }
 
 export type FacebookStore = {
@@ -249,26 +261,65 @@ async function writeStoreToFirestore(store: FacebookStore): Promise<void> {
   if (!res.ok) throw new Error(raw || `Firestore write failed (${res.status})`)
 }
 
-async function readStore(): Promise<FacebookStore> {
-  if (FACEBOOK_STORE_BACKEND === 'file') {
-    return readStoreFromFile()
+function repairConversationMessageAuthors(conv: FacebookStoredConversation): boolean {
+  let changed = false
+  let ids = [...(conv.aiMessageIds ?? [])]
+  for (const m of conv.messages) {
+    if (m.author === 'system' || m.author === 'ai') ids = rememberAiMessageId(ids, m.id)
   }
-  try {
-    const firestoreStore = await readStoreFromFirestore()
-    if (firestoreStore) return firestoreStore
-  } catch (e) {
-    console.warn('[facebook-store] Firestore read fallback to file:', e)
-  }
-  const fileStore = await readStoreFromFile()
-  if (fileStore.conversations.length || fileStore.pages.length) {
-    try {
-      await writeStoreToFirestore(fileStore)
-      console.log('[facebook-store] Seeded Firestore from file store.')
-    } catch (e) {
-      console.warn('[facebook-store] Could not seed Firestore from file store:', e)
+  for (const m of conv.messages) {
+    if (!ids.includes(m.id)) continue
+    if (m.author !== 'ai') {
+      m.author = 'ai'
+      changed = true
     }
   }
-  return fileStore
+  const prevLen = conv.aiMessageIds?.length ?? 0
+  if (ids.length !== prevLen || ids.some((id, i) => conv.aiMessageIds?.[i] !== id)) {
+    conv.aiMessageIds = ids
+    changed = true
+  }
+  return changed
+}
+
+function repairStoreMessageAuthors(store: FacebookStore): boolean {
+  let changed = false
+  for (const conv of store.conversations) {
+    if (repairConversationMessageAuthors(conv)) changed = true
+  }
+  return changed
+}
+
+async function readStore(): Promise<FacebookStore> {
+  let store: FacebookStore
+  if (FACEBOOK_STORE_BACKEND === 'file') {
+    store = await readStoreFromFile()
+  } else {
+    try {
+      const firestoreStore = await readStoreFromFirestore()
+      if (firestoreStore) {
+        store = firestoreStore
+      } else {
+        store = await readStoreFromFile()
+        if (store.conversations.length || store.pages.length) {
+          try {
+            await writeStoreToFirestore(store)
+            console.log('[facebook-store] Seeded Firestore from file store.')
+          } catch (e) {
+            console.warn('[facebook-store] Could not seed Firestore from file store:', e)
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[facebook-store] Firestore read fallback to file:', e)
+      store = await readStoreFromFile()
+    }
+  }
+  if (repairStoreMessageAuthors(store)) {
+    store.updatedAt = new Date().toISOString()
+    await writeStore(store)
+  }
+  return store
 }
 
 async function writeStore(store: FacebookStore): Promise<void> {
@@ -297,6 +348,7 @@ function normalizeReferral(referral?: WebhookReferral): FacebookAdAttribution | 
     title: ctx?.ad_title,
     photoUrl: ctx?.photo_url,
     videoUrl: ctx?.video_url,
+    postId: ctx?.post_id,
     raw: referral,
   }
   return Object.values(ad).some(Boolean) ? ad : undefined
@@ -504,6 +556,31 @@ export async function readFacebookStoreSnapshot(): Promise<FacebookStore> {
   return readStore()
 }
 
+export type FacebookAiReplyTarget = {
+  conversationId: string
+  pageId: string
+  customerPsid: string
+}
+
+/** Hội thoại tin cuối từ khách, AI bật — cần bot trả lời. */
+export function listUnrepliedFacebookAiTargets(store: FacebookStore): FacebookAiReplyTarget[] {
+  const pagesById = new Map(store.pages.map((p) => [p.id, p]))
+  const out: FacebookAiReplyTarget[] = []
+  for (const conv of store.conversations) {
+    if (conv.aiEnabled === false) continue
+    const page = pagesById.get(conv.pageId)
+    if (!page || page.aiMasterEnabled === false) continue
+    const last = conv.messages[conv.messages.length - 1]
+    if (!last || last.author !== 'customer') continue
+    out.push({
+      conversationId: conv.id,
+      pageId: conv.pageId,
+      customerPsid: conv.customerPsid,
+    })
+  }
+  return out
+}
+
 const BRANCH_IDS = new Set(BRANCH_PAGES.map((b) => b.id))
 
 export async function patchFacebookConversation(
@@ -592,26 +669,42 @@ export async function saveFacebookPages(pages: FacebookPageRecord[]): Promise<Fa
   return store.pages
 }
 
+export type EnrichFacebookProfilesOptions = {
+  /** Giới hạn số hội thoại enrich mỗi lần (tránh chặn GET inbox). */
+  maxPerRun?: number
+  concurrency?: number
+}
+
 export async function enrichFacebookConversationProfiles(
   resolveCustomerProfile: (
     pageId: string,
     customerPsid: string,
   ) => Promise<FacebookCustomerProfile | null>,
+  options?: EnrichFacebookProfilesOptions,
 ): Promise<number> {
   const store = await readStore()
+  const maxPerRun = options?.maxPerRun ?? Number.POSITIVE_INFINITY
+  const concurrency = Math.max(1, Math.min(options?.concurrency ?? 4, 8))
+  const pending = store.conversations.filter((c) => !c.customerName || !c.avatarUrl).slice(0, maxPerRun)
+  if (!pending.length) return 0
+
   let updated = 0
-  for (const conversation of store.conversations) {
-    if (conversation.customerName && conversation.avatarUrl) continue
-    const profile = await resolveCustomerProfile(conversation.pageId, conversation.customerPsid).catch(() => null)
-    if (!profile?.name && !profile?.avatarUrl) continue
-    if (profile.name && profile.name !== conversation.customerName) {
-      conversation.customerName = profile.name
-      updated += 1
-    }
-    if (profile.avatarUrl && profile.avatarUrl !== conversation.avatarUrl) {
-      conversation.avatarUrl = profile.avatarUrl
-      updated += 1
-    }
+  for (let i = 0; i < pending.length; i += concurrency) {
+    const chunk = pending.slice(i, i + concurrency)
+    await Promise.all(
+      chunk.map(async (conversation) => {
+        const profile = await resolveCustomerProfile(conversation.pageId, conversation.customerPsid).catch(() => null)
+        if (!profile?.name && !profile?.avatarUrl) return
+        if (profile.name && profile.name !== conversation.customerName) {
+          conversation.customerName = profile.name
+          updated += 1
+        }
+        if (profile.avatarUrl && profile.avatarUrl !== conversation.avatarUrl) {
+          conversation.avatarUrl = profile.avatarUrl
+          updated += 1
+        }
+      }),
+    )
   }
   if (updated) {
     store.updatedAt = new Date().toISOString()
@@ -678,7 +771,15 @@ export async function ingestFacebookWebhookPayload(
 
       const isEcho = Boolean(message?.is_echo)
       const customerPsid = senderId === pageId ? recipientId : senderId
-      const author: FacebookStoredMessage['author'] = senderId === pageId || isEcho ? 'page' : 'customer'
+      const profile = await options?.resolveCustomerProfile?.(pageId, customerPsid).catch(() => null)
+      const conversation = upsertConversation(store, pageId, customerPsid, timestamp, profile)
+      const outboundMid = message?.mid?.trim() || postback?.mid?.trim()
+      const isOutbound = senderId === pageId || isEcho
+      const author: FacebookMessageAuthor = isOutbound
+        ? isStoredAiMessageId(conversation.aiMessageIds, outboundMid)
+          ? 'ai'
+          : 'staff'
+        : 'customer'
       let { images: attImages, videos: attVideos, audios: attAudios } = extractAttachmentMedia(message)
       const mid = message?.mid?.trim()
       const attList = message?.attachments
@@ -715,8 +816,6 @@ export async function ingestFacebookWebhookPayload(
         else text = PLACEHOLDER_NO_TEXT
       }
 
-      const profile = await options?.resolveCustomerProfile?.(pageId, customerPsid).catch(() => null)
-      const conversation = upsertConversation(store, pageId, customerPsid, timestamp, profile)
       const id =
         message?.mid ||
         postback?.mid ||
@@ -729,7 +828,8 @@ export async function ingestFacebookWebhookPayload(
         audioCount: attAudios.length,
         adTitle: conversation.ad?.title,
       })
-      if (!conversation.messages.some((item) => item.id === id)) {
+      const existingMsg = conversation.messages.find((item) => item.id === id)
+      if (!existingMsg) {
         conversation.messages.push({
           id,
           author,
@@ -748,6 +848,10 @@ export async function ingestFacebookWebhookPayload(
             pageId,
             customerPsid,
           })
+        }
+      } else if (isStoredAiMessageId(conversation.aiMessageIds, id)) {
+        if (normalizeStoredMessageAuthor(existingMsg.author, existingMsg.id) !== 'ai') {
+          existingMsg.author = 'ai'
         }
       }
       conversationsTouched += 1
@@ -785,8 +889,16 @@ export async function appendOutboundFacebookMessage(input: {
     }
     store.conversations.unshift(conv)
   }
-  if (!conv.messages.some((m) => m.id === input.message.id)) {
-    conv.messages.push(input.message)
+  const normalizedAuthor = normalizeStoredMessageAuthor(input.message.author, input.message.id)
+  if (normalizedAuthor === 'ai') {
+    registerAiOutboundMessageId(input.message.id)
+    conv.aiMessageIds = rememberAiMessageId(conv.aiMessageIds, input.message.id)
+  }
+  const existing = conv.messages.find((m) => m.id === input.message.id)
+  if (existing) {
+    if (normalizedAuthor === 'ai') existing.author = 'ai'
+  } else {
+    conv.messages.push({ ...input.message, author: normalizedAuthor })
   }
   conv.lastMessageAt = input.message.timestamp
   conv.updatedAt = input.message.timestamp

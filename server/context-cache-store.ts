@@ -1,5 +1,5 @@
 import { buildContextCacheFingerprint } from '../shared/context-cache-key.ts'
-import { createCachedContentWithRetry } from './gemini-cache.ts'
+import { createCachedContentWithRetry, deleteCachedContent } from './gemini-cache.ts'
 
 const EXPIRE_BUFFER_MS = 30_000
 
@@ -25,6 +25,36 @@ export function clearSharedContextCacheStore(): void {
 export function evictSharedContextCache(model: string, systemPrompt: string): void {
   const fingerprint = buildContextCacheFingerprint(model, systemPrompt)
   entries.delete(fingerprint)
+}
+
+/** Bỏ entry local và xoá bản ghi cache trên Google (dừng billing storage sớm). */
+export async function evictSharedContextCacheAndDeleteRemote(
+  apiKey: string,
+  model: string,
+  systemPrompt: string,
+): Promise<void> {
+  const fingerprint = buildContextCacheFingerprint(model, systemPrompt)
+  const entry = entries.get(fingerprint)
+  entries.delete(fingerprint)
+  if (entry) {
+    await deleteCachedContent(apiKey, entry.name)
+  }
+}
+
+/** Xoá mọi cache đã biết trên Google và làm sạch store (dùng khi sửa CONTEXT, purge tay, shutdown). */
+export async function purgeAllSharedContextCachesRemote(apiKey: string): Promise<number> {
+  await Promise.allSettled([...inflight.values()])
+  const seen = new Set<string>()
+  let n = 0
+  for (const entry of entries.values()) {
+    if (seen.has(entry.name)) continue
+    seen.add(entry.name)
+    await deleteCachedContent(apiKey, entry.name)
+    n += 1
+  }
+  entries.clear()
+  inflight.clear()
+  return n
 }
 
 export async function ensureSharedContextCache(

@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import type { ChangeEvent, KeyboardEvent } from 'react'
+import type { ChangeEvent, KeyboardEvent, SyntheticEvent } from 'react'
 import './App.css'
 import { BRANCH_PAGES } from '../shared/salon-ai-context.ts'
 import { TrainingChat } from './TrainingChat'
@@ -29,6 +29,7 @@ type MessageReferral = {
   refererUri?: string
   photoUrl?: string
   videoUrl?: string
+  postId?: string
 }
 
 type Message = {
@@ -67,6 +68,7 @@ type Conversation = {
     sourceUrl?: string
     photoUrl?: string
     videoUrl?: string
+    postId?: string
   }
   customerReadAt?: string
   pageDeliveredAt?: string
@@ -96,7 +98,7 @@ type FacebookStatus = {
 
 type FacebookStoreMessage = {
   id: string
-  author: 'customer' | 'page' | 'system'
+  author: 'customer' | 'ai' | 'staff' | 'page' | 'system'
   text: string
   timestamp: string
   images?: string[]
@@ -205,16 +207,27 @@ function isPlaceholderInboxText(text?: string): boolean {
   return t === PLACEHOLDER_NO_TEXT || t === PLACEHOLDER_REFERRAL
 }
 
-function adContextFromRaw(raw: unknown): { title?: string; photoUrl?: string; videoUrl?: string } {
+function adContextFromRaw(raw: unknown): {
+  title?: string
+  photoUrl?: string
+  videoUrl?: string
+  postId?: string
+} {
   if (!raw || typeof raw !== 'object') return {}
   const top = raw as Record<string, unknown>
   const ads = top.ads_context_data
   if (ads && typeof ads === 'object') {
-    const a = ads as { ad_title?: string; photo_url?: string; video_url?: string }
+    const a = ads as {
+      ad_title?: string
+      photo_url?: string
+      video_url?: string
+      post_id?: string
+    }
     return {
       title: typeof a.ad_title === 'string' ? a.ad_title : undefined,
       photoUrl: typeof a.photo_url === 'string' ? a.photo_url : undefined,
       videoUrl: typeof a.video_url === 'string' ? a.video_url : undefined,
+      postId: typeof a.post_id === 'string' ? a.post_id : undefined,
     }
   }
   return {}
@@ -224,11 +237,13 @@ function adContextFromRaw(raw: unknown): { title?: string; photoUrl?: string; vi
 function deepFindAdsContextData(
   node: unknown,
   depth = 0,
-): { ad_title?: string; photo_url?: string; video_url?: string } | undefined {
+): { ad_title?: string; photo_url?: string; video_url?: string; post_id?: string } | undefined {
   if (depth > 8 || !node || typeof node !== 'object') return undefined
   const n = node as Record<string, unknown>
   const direct = n.ads_context_data
-  if (direct && typeof direct === 'object') return direct as { ad_title?: string; photo_url?: string; video_url?: string }
+  if (direct && typeof direct === 'object') {
+    return direct as { ad_title?: string; photo_url?: string; video_url?: string; post_id?: string }
+  }
   for (const key of Object.keys(n)) {
     const found = deepFindAdsContextData(n[key], depth + 1)
     if (found) return found
@@ -238,16 +253,23 @@ function deepFindAdsContextData(
 
 function extractAdsContext(
   ad?: MessageReferral | FacebookStoreMessage['referral'] | Conversation['sourceAd'] | null,
-): { title?: string; photoUrl?: string; videoUrl?: string } {
+): { title?: string; photoUrl?: string; videoUrl?: string; postId?: string } {
   if (!ad || typeof ad !== 'object') return {}
-  const bag = ad as { raw?: unknown; ads_context_data?: unknown }
+  const bag = ad as { raw?: unknown; ads_context_data?: unknown; postId?: string }
+  const basePostId = bag.postId?.trim() ? { postId: bag.postId.trim() } : {}
   const fromTop = bag.ads_context_data
   if (fromTop && typeof fromTop === 'object') {
-    const a = fromTop as { ad_title?: string; photo_url?: string; video_url?: string }
+    const a = fromTop as {
+      ad_title?: string
+      photo_url?: string
+      video_url?: string
+      post_id?: string
+    }
     const t = typeof a.ad_title === 'string' ? a.ad_title : undefined
     const p = typeof a.photo_url === 'string' ? a.photo_url : undefined
     const v = typeof a.video_url === 'string' ? a.video_url : undefined
-    if (t || p || v) return { title: t, photoUrl: p, videoUrl: v }
+    const postId = typeof a.post_id === 'string' ? a.post_id : undefined
+    if (t || p || v || postId) return { title: t, photoUrl: p, videoUrl: v, postId: postId ?? basePostId.postId }
   }
   let raw = bag.raw
   if (typeof raw === 'string') {
@@ -258,13 +280,16 @@ function extractAdsContext(
     }
   }
   const shallow = adContextFromRaw(raw)
-  if (shallow.title || shallow.photoUrl || shallow.videoUrl) return shallow
+  if (shallow.title || shallow.photoUrl || shallow.videoUrl || shallow.postId) {
+    return { ...shallow, postId: shallow.postId ?? basePostId.postId }
+  }
   const deepRaw = deepFindAdsContextData(raw)
   if (deepRaw) {
     return {
       title: typeof deepRaw.ad_title === 'string' ? deepRaw.ad_title : undefined,
       photoUrl: typeof deepRaw.photo_url === 'string' ? deepRaw.photo_url : undefined,
       videoUrl: typeof deepRaw.video_url === 'string' ? deepRaw.video_url : undefined,
+      postId: typeof deepRaw.post_id === 'string' ? deepRaw.post_id : basePostId.postId,
     }
   }
   const deepAd = deepFindAdsContextData(ad)
@@ -273,9 +298,10 @@ function extractAdsContext(
       title: typeof deepAd.ad_title === 'string' ? deepAd.ad_title : undefined,
       photoUrl: typeof deepAd.photo_url === 'string' ? deepAd.photo_url : undefined,
       videoUrl: typeof deepAd.video_url === 'string' ? deepAd.video_url : undefined,
+      postId: typeof deepAd.post_id === 'string' ? deepAd.post_id : basePostId.postId,
     }
   }
-  return {}
+  return basePostId
 }
 
 function enrichAdLike(
@@ -283,7 +309,7 @@ function enrichAdLike(
 ): MessageReferral | undefined {
   if (!ad) return undefined
   const ctx = extractAdsContext(ad)
-  const ext = ad as { refererUri?: string; type?: string }
+  const ext = ad as { refererUri?: string; type?: string; postId?: string }
   const out: MessageReferral = {
     adId: ad.adId,
     title: ad.title ?? ctx.title,
@@ -294,8 +320,18 @@ function enrichAdLike(
     refererUri: ext.refererUri,
     photoUrl: ad.photoUrl ?? ctx.photoUrl,
     videoUrl: ad.videoUrl ?? ctx.videoUrl,
+    postId: ext.postId ?? ctx.postId,
   }
-  if (!out.adId && !out.title && !out.photoUrl && !out.videoUrl && !out.ref && !out.source && !out.sourceUrl)
+  if (
+    !out.adId &&
+    !out.title &&
+    !out.photoUrl &&
+    !out.videoUrl &&
+    !out.postId &&
+    !out.ref &&
+    !out.source &&
+    !out.sourceUrl
+  )
     return undefined
   return out
 }
@@ -329,15 +365,63 @@ function urlLooksLikeStaticImage(url: string): boolean {
   return false
 }
 
+/** Meta OPEN_THREAD: `video_url` thường là thumbnail JPG, không phải file .mp4. */
+function urlLooksLikeReferralVideoFile(url: string): boolean {
+  const path = url.split(/[?#]/)[0] ?? url
+  return /\.(mp4|webm|mov|m4v)$/i.test(path)
+}
+
+function referralThumbnailUrl(referral: MessageReferral): string | undefined {
+  if (referral.photoUrl) return referral.photoUrl
+  if (referral.videoUrl && !urlLooksLikeReferralVideoFile(referral.videoUrl)) return referral.videoUrl
+  return undefined
+}
+
 function urlLooksLikeAudioFile(url: string): boolean {
   return /\.(mp3|aac|m4a|oga|ogg|opus|wav|weba|amr|3gp|caf)($|\?)/i.test(url.split(/[?#]/)[0])
 }
 
-function creativePreviewUrl(ad?: MessageReferral | null): string | undefined {
-  if (!ad) return undefined
-  if (ad.photoUrl) return ad.photoUrl
-  if (ad.videoUrl && urlLooksLikeStaticImage(ad.videoUrl)) return ad.videoUrl
-  return undefined
+/** Liên kết mở QC — ad_id referral ≠ id Thư viện QC; ưu tiên bài đăng + thư viện theo fanpage. */
+function referralOpenLinks(
+  referral: MessageReferral,
+  pageId?: string,
+): { href: string; label: string }[] {
+  const links: { href: string; label: string }[] = []
+  const seen = new Set<string>()
+  const push = (href: string | undefined, label: string) => {
+    const h = href?.trim()
+    if (!h || !/^https?:\/\//i.test(h) || seen.has(h)) return
+    seen.add(h)
+    links.push({ href: h, label })
+  }
+  push(referral.sourceUrl, 'Mở liên kết quảng cáo')
+  push(referral.refererUri, 'Mở trên Facebook')
+  const postId = referral.postId?.trim()
+  const pid = pageId?.trim()
+  if (postId && pid) {
+    push(`https://www.facebook.com/${pid}/posts/${postId}`, 'Xem bài đăng QC')
+  }
+  if (pid) {
+    push(
+      `https://www.facebook.com/ads/library/?active_status=all&ad_type=all&country=VN&view_all_page_id=${encodeURIComponent(pid)}`,
+      'Quảng cáo của fanpage',
+    )
+  }
+  return links
+}
+
+function ReferralAdLinks({ referral, pageId }: { referral: MessageReferral; pageId?: string }) {
+  const links = referralOpenLinks(referral, pageId)
+  if (!links.length) return null
+  return (
+    <div className="bubble-ad-actions" role="group" aria-label="Liên kết quảng cáo">
+      {links.map((l) => (
+        <a key={l.href} className="bubble-ad-link" href={l.href} target="_blank" rel="noreferrer">
+          {l.label}
+        </a>
+      ))}
+    </div>
+  )
 }
 
 /** fbcdn thường chặn hotlink từ web app — tải qua proxy server. */
@@ -360,10 +444,49 @@ function metaHostedMediaSrc(original: string): string {
   return original
 }
 
-function AdCreativeMedia({ referral }: { referral: MessageReferral }) {
-  const original = creativePreviewUrl(referral)
-  if (original) {
-    const proxied = metaHostedMediaSrc(original)
+function AdCreativeMedia({ referral, pageId }: { referral: MessageReferral; pageId: string }) {
+  const [fresh, setFresh] = useState<{ imageUrl?: string; videoUrl?: string } | null>(null)
+  const [mediaFailed, setMediaFailed] = useState(false)
+
+  useEffect(() => {
+    setFresh(null)
+    setMediaFailed(false)
+    const postId = referral.postId?.trim()
+    if (!postId || !pageId.trim()) return
+    let cancelled = false
+    void fetch(
+      `/api/facebook/ad-creative?pageId=${encodeURIComponent(pageId)}&postId=${encodeURIComponent(postId)}`,
+      { cache: 'no-store' },
+    )
+      .then((r) => r.json())
+      .then((d: { ok?: boolean; imageUrl?: string; videoUrl?: string }) => {
+        if (cancelled || !d?.ok) return
+        if (d.imageUrl || d.videoUrl) setFresh({ imageUrl: d.imageUrl, videoUrl: d.videoUrl })
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [pageId, referral.postId])
+
+  const thumb = referralThumbnailUrl(referral)
+  const imageUrl = fresh?.imageUrl || thumb
+  const videoUrl =
+    fresh?.videoUrl ||
+    (referral.videoUrl && urlLooksLikeReferralVideoFile(referral.videoUrl) ? referral.videoUrl : undefined)
+
+  const onMediaError = (original: string) => (ev: SyntheticEvent<HTMLImageElement | HTMLVideoElement>) => {
+    const el = ev.currentTarget
+    if (el.dataset.fallback === '1') {
+      setMediaFailed(true)
+      return
+    }
+    el.dataset.fallback = '1'
+    el.src = original
+  }
+
+  if (!mediaFailed && imageUrl) {
+    const proxied = metaHostedMediaSrc(imageUrl)
     return (
       <img
         className="bubble-ad-creative"
@@ -371,19 +494,34 @@ function AdCreativeMedia({ referral }: { referral: MessageReferral }) {
         alt=""
         loading="lazy"
         referrerPolicy="no-referrer"
-        onError={(ev) => {
-          const el = ev.currentTarget
-          if (el.dataset.fallback === '1') return
-          el.dataset.fallback = '1'
-          el.src = original
-        }}
+        onError={onMediaError(imageUrl)}
       />
     )
   }
-  if (referral.videoUrl)
+
+  if (!mediaFailed && videoUrl) {
+    const proxied = metaHostedMediaSrc(videoUrl)
     return (
-      <video className="bubble-ad-video" src={referral.videoUrl} controls playsInline preload="metadata" />
+      <video
+        className="bubble-ad-video"
+        src={proxied}
+        controls
+        playsInline
+        preload="metadata"
+        onError={onMediaError(videoUrl)}
+      />
     )
+  }
+
+  if (referral.postId || referral.adId) {
+    return (
+      <p className="bubble-ad-expired">
+        Ảnh/video xem trước đã hết hạn hoặc không tải được. Bấm <strong>Xem bài đăng QC</strong> bên dưới để xem trên
+        Facebook
+      </p>
+    )
+  }
+
   return null
 }
 
@@ -500,6 +638,21 @@ function MessageMediaGallery({
   )
 }
 
+function mapInboxMessageAuthor(author: FacebookStoreMessage['author']): Message['author'] {
+  if (author === 'ai' || author === 'system') return 'ai'
+  if (author === 'staff' || author === 'page') return 'staff'
+  return 'customer'
+}
+
+function inboxAuthorMeta(
+  author: Message['author'],
+  customerName: string,
+): { label: string; badge: string } {
+  if (author === 'customer') return { label: customerName, badge: 'Khách' }
+  if (author === 'ai') return { label: 'AI tự động', badge: 'AI' }
+  return { label: 'Nhân viên / người khác', badge: 'NV' }
+}
+
 function mapStoredConversation(item: FacebookStoreConversation): Conversation {
   const fallbackName = `Khách ${item.customerPsid.slice(-6)}`
   const customer = item.customerName?.trim() || fallbackName
@@ -529,7 +682,7 @@ function mapStoredConversation(item: FacebookStoreConversation): Conversation {
       const referral = enrichAdLike(message.referral ?? undefined)
       return {
         id: message.id,
-        author: message.author === 'page' ? 'staff' : message.author === 'system' ? 'ai' : 'customer',
+        author: mapInboxMessageAuthor(message.author),
         text: message.text,
         time: formatMessageTime(message.timestamp),
         referralAdId: referral?.adId ?? message.referral?.adId,
@@ -551,10 +704,24 @@ function mapStoredConversation(item: FacebookStoreConversation): Conversation {
 }
 
 function Avatar({ conversation, large = false }: { conversation: Conversation; large?: boolean }) {
+  const [imgFailed, setImgFailed] = useState(false)
+  const avatarSrc =
+    conversation.avatarUrl && !imgFailed ? metaHostedMediaSrc(conversation.avatarUrl) : null
+
+  useEffect(() => {
+    setImgFailed(false)
+  }, [conversation.id, conversation.avatarUrl])
+
   return (
     <span className={large ? 'avatar large' : 'avatar'}>
-      {conversation.avatarUrl ? (
-        <img src={conversation.avatarUrl} alt={conversation.customer} />
+      {avatarSrc ? (
+        <img
+          src={avatarSrc}
+          alt={conversation.customer}
+          loading="lazy"
+          referrerPolicy="no-referrer"
+          onError={() => setImgFailed(true)}
+        />
       ) : (
         conversation.avatar
       )}
@@ -890,9 +1057,19 @@ function App() {
           })),
         )
       }
+      const inboxData = await fetchFacebookInboxData()
+      setConversations(inboxData.conversations)
+      setPages((prev) =>
+        inboxData.pages.map((page) => ({
+          ...page,
+          unread: prev.find((p) => p.id === page.id)?.unread ?? page.unread,
+        })),
+      )
       setSyncState(facebookStatus?.configured ? 'live' : 'needs-keys')
       setSyncMessage(
-        facebookStatus?.configured ? 'Danh sách fanpage đã được cập nhật.' : facebookSetupMessage(facebookStatus),
+        facebookStatus?.configured
+          ? `Đã cập nhật ${inboxData.pages.length} fanpage · ${inboxData.conversations.length} hội thoại.`
+          : facebookSetupMessage(facebookStatus),
       )
     } catch (e) {
       setSyncState('error')
@@ -1289,62 +1466,57 @@ function App() {
                       </div>
                     </div>
 
-                    <label className="ai-switch">
-                      <span>
+                    <label
+                      className={`ai-switch${selectedPage?.aiMasterEnabled === false ? ' ai-switch-page-off' : ''}`}
+                    >
+                      <span className="ai-switch-copy">
                         <strong>AI trả lời</strong>
                         <small>
-                          {selectedConversation.aiEnabled ? 'Tự động phản hồi tin mới' : 'Tạm dừng cho hội thoại này'}
                           {selectedPage?.aiMasterEnabled === false
-                            ? ' · Fanpage đang tắt AI toàn page (bật trong ⚙ fanpage để chạy).'
-                            : ''}
+                            ? 'Fanpage đang tắt AI toàn page — bật trong ⚙ fanpage.'
+                            : selectedConversation.aiEnabled
+                              ? 'Tự động phản hồi tin mới'
+                              : 'Tạm dừng cho hội thoại này'}
                         </small>
                       </span>
-                      <input
-                        type="checkbox"
-                        checked={selectedConversation.aiEnabled}
-                        onChange={() => toggleAi(selectedConversation.id)}
-                      />
-                      <i aria-hidden="true" />
+                      <span className="ai-switch-track">
+                        <input
+                          type="checkbox"
+                          checked={selectedConversation.aiEnabled}
+                          disabled={selectedPage?.aiMasterEnabled === false}
+                          onChange={() => toggleAi(selectedConversation.id)}
+                        />
+                        <i aria-hidden="true" />
+                      </span>
                     </label>
                   </header>
 
                   <div className="message-feed" ref={messageFeedRef}>
+                    <div className="message-author-legend" aria-label="Chú thích người gửi">
+                      <span className="legend-item legend-customer">
+                        <i className="legend-dot" aria-hidden="true" />
+                        Khách
+                      </span>
+                      <span className="legend-item legend-ai">
+                        <i className="legend-dot" aria-hidden="true" />
+                        AI tự động
+                      </span>
+                      <span className="legend-item legend-staff">
+                        <i className="legend-dot" aria-hidden="true" />
+                        Nhân viên / người khác
+                      </span>
+                    </div>
                     <div className="conversation-intel">
                       <div>
                         <span>Nguồn quảng cáo</span>
-                        {(() => {
-                          const ad = selectedConversation.sourceAd as MessageReferral | undefined
-                          const thumb = creativePreviewUrl(ad)
-                          if (thumb) {
-                            const proxied = metaHostedMediaSrc(thumb)
-                            return (
-                              <img
-                                className="intel-ad-thumb"
-                                src={proxied}
-                                alt=""
-                                loading="lazy"
-                                referrerPolicy="no-referrer"
-                                onError={(ev) => {
-                                  const el = ev.currentTarget
-                                  if (el.dataset.fallback === '1') return
-                                  el.dataset.fallback = '1'
-                                  el.src = thumb
-                                }}
-                              />
-                            )
-                          }
-                          if (ad?.videoUrl)
-                            return (
-                              <video
-                                className="intel-ad-thumb intel-ad-video"
-                                src={metaHostedMediaSrc(ad.videoUrl)}
-                                controls
-                                playsInline
-                                preload="metadata"
-                              />
-                            )
-                          return null
-                        })()}
+                        {selectedConversation.sourceAd ? (
+                          <div className="intel-ad-creative-wrap">
+                            <AdCreativeMedia
+                              referral={selectedConversation.sourceAd as MessageReferral}
+                              pageId={selectedConversation.pageId}
+                            />
+                          </div>
+                        ) : null}
                         <strong>
                           {selectedConversation.sourceAd?.title ||
                             selectedConversation.sourceAd?.adId ||
@@ -1356,6 +1528,12 @@ function App() {
                         {selectedConversation.sourceAd?.ref && (
                           <small>Ref: {selectedConversation.sourceAd.ref}</small>
                         )}
+                        {selectedConversation.sourceAd ? (
+                          <ReferralAdLinks
+                            referral={selectedConversation.sourceAd as MessageReferral}
+                            pageId={selectedConversation.pageId}
+                          />
+                        ) : null}
                       </div>
                       <div>
                         <span>Trạng thái Messenger</span>
@@ -1389,36 +1567,32 @@ function App() {
                       return (
                       <article key={message.id} className={`bubble ${message.author}`}>
                         <span className="bubble-meta">
-                          {message.author === 'customer'
-                            ? selectedConversation.customer
-                            : message.author === 'ai'
-                              ? 'AI'
-                              : 'Nhân viên'}
-                          {' · '}
-                          {message.time}
+                          {(() => {
+                            const meta = inboxAuthorMeta(message.author, selectedConversation.customer)
+                            return (
+                              <>
+                                <span className={`author-badge author-badge-${message.author}`}>
+                                  {meta.badge}
+                                </span>
+                                <span className="author-label">{meta.label}</span>
+                                <span className="bubble-time">{message.time}</span>
+                              </>
+                            )
+                          })()}
                         </span>
                         {referralBlock ? (
                           <div className="bubble-ad-card">
                             {message.referral!.title ? (
                               <strong className="bubble-ad-title">{message.referral!.title}</strong>
                             ) : null}
-                            <AdCreativeMedia referral={message.referral!} />
+                            <AdCreativeMedia referral={message.referral!} pageId={selectedConversation.pageId} />
                             <div className="bubble-ad-meta">
                               {message.referral!.source ? <span>{message.referral!.source}</span> : null}
                               {message.referral!.type ? <span>{message.referral!.type}</span> : null}
                               {message.referral!.adId ? <span>Ad ID: {message.referral!.adId}</span> : null}
                               {message.referral!.ref ? <span>Ref: {message.referral!.ref}</span> : null}
-                              {message.referral!.sourceUrl ? (
-                                <a
-                                  className="bubble-ad-link"
-                                  href={message.referral!.sourceUrl}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                >
-                                  Mở liên kết
-                                </a>
-                              ) : null}
                             </div>
+                            <ReferralAdLinks referral={message.referral!} pageId={selectedConversation.pageId} />
                           </div>
                         ) : null}
                         <MessageMediaGallery

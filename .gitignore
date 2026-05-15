@@ -12,12 +12,17 @@ dist-ssr
 dist-server
 *.local
 .env.*.local
+deploy/env/server.env
+data/facebook-token-vault.json
 
 # Bản dump debug webhook (PSID) — tạo khi FACEBOOK_WEBHOOK_LOG_RAW_BODY=1
 data/facebook-webhook-last.json
 
 # Release archives — GitHub không cho push file > 100MB, build local rồi upload thẳng.
 release/
+
+# Google Cloud SDK local config/credentials (không đưa lên GitHub)
+.gcloud/
 
 # Editor directories and files
 .vscode/*

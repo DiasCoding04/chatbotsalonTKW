@@ -762,15 +762,19 @@
 }
 
 .ai-switch {
-  display: grid;
-  grid-template-columns: minmax(90px, auto) auto;
+  display: flex;
   align-items: center;
-  gap: 10px;
+  justify-content: flex-end;
+  gap: 12px;
+  flex-shrink: 0;
+  max-width: min(100%, 320px);
   cursor: pointer;
   user-select: none;
 }
 
-.ai-switch span {
+.ai-switch-copy {
+  flex: 1;
+  min-width: 0;
   text-align: right;
 }
 
@@ -786,21 +790,46 @@
 .ai-switch small {
   color: #667085;
   font-size: 0.72rem;
+  line-height: 1.35;
+}
+
+.ai-switch-track {
+  position: relative;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  width: 52px;
+  height: 30px;
 }
 
 .ai-switch input {
   position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
   opacity: 0;
-  pointer-events: none;
+  cursor: pointer;
+  z-index: 1;
+}
+
+.ai-switch input:disabled {
+  cursor: not-allowed;
+}
+
+.ai-switch-page-off .ai-switch-track i {
+  opacity: 0.55;
 }
 
 .ai-switch i {
   position: relative;
+  display: block;
   width: 52px;
   height: 30px;
   border-radius: 999px;
   background: #d0d5dd;
   transition: background 0.18s ease;
+  pointer-events: none;
 }
 
 .ai-switch i::after {
@@ -904,12 +933,104 @@
   background: #eff6ff;
 }
 
+.message-author-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  align-self: stretch;
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px dashed #d0d5dd;
+  background: #f9fafb;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #475467;
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.legend-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  display: inline-block;
+}
+
+.legend-customer .legend-dot {
+  background: #ffffff;
+  border: 2px solid #98a2b3;
+}
+
+.legend-ai .legend-dot {
+  background: #22c55e;
+  border: 2px solid #16a34a;
+}
+
+.legend-staff .legend-dot {
+  background: #3b82f6;
+  border: 2px solid #2563eb;
+}
+
 .bubble-meta {
-  display: block;
-  margin-bottom: 4px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  margin-bottom: 6px;
   color: #667085;
   font-size: 0.7rem;
   font-weight: 800;
+}
+
+.author-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.6rem;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 0.62rem;
+  font-weight: 900;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.author-badge-customer {
+  color: #344054;
+  background: #f2f4f7;
+  border: 1px solid #d0d5dd;
+}
+
+.author-badge-ai {
+  color: #166534;
+  background: #dcfce7;
+  border: 1px solid #86efac;
+}
+
+.author-badge-staff {
+  color: #1d4ed8;
+  background: #dbeafe;
+  border: 1px solid #93c5fd;
+}
+
+.author-label {
+  color: #344054;
+}
+
+.bubble-time {
+  color: #98a2b3;
+  font-weight: 600;
+}
+
+.bubble-time::before {
+  content: '·';
+  margin-right: 6px;
+  color: #d0d5dd;
 }
 
 .bubble p {
@@ -1032,6 +1153,47 @@
 
 .bubble-ad-link:hover {
   text-decoration: underline;
+}
+
+.bubble-ad-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-top: 10px;
+}
+
+.bubble-ad-actions .bubble-ad-link {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: #eff4ff;
+  border: 1px solid #b2ccff;
+}
+
+.bubble-ad-actions .bubble-ad-link:hover {
+  background: #d1e0ff;
+}
+
+.bubble-ad-expired {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #fffaeb;
+  border: 1px solid #fec84b;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: #7a2e0e;
+}
+
+.intel-ad-creative-wrap .bubble-ad-creative,
+.intel-ad-creative-wrap .bubble-ad-video {
+  max-height: 120px;
+  margin-top: 8px;
+}
+
+.intel-ad-creative-wrap .bubble-ad-expired {
+  margin-top: 8px;
 }
 
 .intel-ad-thumb {
@@ -1574,10 +1736,11 @@
 
   .ai-switch {
     width: 100%;
-    grid-template-columns: 1fr auto;
+    max-width: none;
+    justify-content: space-between;
   }
 
-  .ai-switch span {
+  .ai-switch-copy {
     text-align: left;
   }
 

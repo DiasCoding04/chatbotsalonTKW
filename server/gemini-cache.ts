@@ -121,3 +121,27 @@ export async function createCachedContentWithRetry(
   }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr))
 }
+
+/** Xoá cached content trên Google/Vertex (best-effort). */
+export async function deleteCachedContent(apiKey: string, name: string): Promise<void> {
+  const trimmed = name.trim()
+  if (!trimmed) return
+
+  try {
+    if (useVertexGeminiBackend()) {
+      const location = vertexLocation()
+      const token = await getVertexAccessToken()
+      const url = `${vertexOrigin(location)}/v1/${trimmed}`
+      await fetch(url, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      return
+    }
+
+    const url = `${GEMINI_API_BASE}/${trimmed}?key=${encodeURIComponent(apiKey)}`
+    await fetch(url, { method: 'DELETE' })
+  } catch {
+    /* ignore */
+  }
+}

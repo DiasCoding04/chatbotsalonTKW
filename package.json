@@ -17,7 +17,8 @@
     "start:server": "tsx server/index.ts",
     "pack:release": "node scripts/pack-release.mjs",
     "pack:update": "node scripts/pack-update.mjs",
-    "assets:upload:gcs": "node scripts/upload-image-samples-to-gcs.mjs"
+    "assets:upload:gcs": "node scripts/upload-image-samples-to-gcs.mjs",
+    "facebook:refresh-tokens": "node scripts/refresh-facebook-page-tokens.mjs"
   },
   "engines": {
     "node": ">=20"

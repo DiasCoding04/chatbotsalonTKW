@@ -20,6 +20,7 @@ import {
   isSharedContextCacheValid,
   readSharedContextCacheRecord,
   resolveSharedContextCache,
+  clearBrowserSharedContextCache,
   SHARED_CONTEXT_CACHE_STORAGE_KEY,
 } from './lib/shared-context-cache'
 import { estimateUsd, getTariff } from './lib/gemini-pricing'
@@ -85,8 +86,6 @@ const EMPTY_STATS: Stats = {
   totalChatInput: 0,
   calls: 0,
 }
-
-const GEMINI_CONTEXT_CACHE_TTL_S = 3600
 
 /** Chờ Context Cache Gemini sẵn sàng (tránh lượt đầu gửi inline full CONTEXT). */
 function waitForContextCache(
@@ -447,12 +446,7 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
 
     void (async () => {
       try {
-        const { name } = await resolveSharedContextCache(
-          apiKey,
-          model,
-          systemPrompt,
-          GEMINI_CONTEXT_CACHE_TTL_S,
-        )
+        const { name } = await resolveSharedContextCache(apiKey, model, systemPrompt)
         if (cancelled) return
         cacheNameRef.current = name
         setCacheStatus({ kind: 'ready', name })
@@ -565,11 +559,10 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
 
     if (!systemPrompt.trim()) return undefined
 
-    const ttl = GEMINI_CONTEXT_CACHE_TTL_S
     let lastErr: unknown
     for (let i = 0; i < 6; i++) {
       try {
-        const { name } = await resolveSharedContextCache(apiKey, model, systemPrompt, ttl)
+        const { name } = await resolveSharedContextCache(apiKey, model, systemPrompt)
         cacheNameRef.current = name
         setCacheStatus({ kind: 'ready', name })
         return name
@@ -694,7 +687,11 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
             finalText,
             imageSampleGroups,
             recentCustomerText,
-            { imageBaseUrl: imageSamplesBaseUrl },
+            {
+              imageBaseUrl: imageSamplesBaseUrl,
+              inferImageKeysFromModelOnly: true,
+              maxImagesPerGroup: 3,
+            },
           )
           finalizeBatchedReply(imageExpanded.apiText, result.usage, imageExpanded.displayText)
 
@@ -1012,9 +1009,10 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
         onSaved={(doc) => {
           setContextMd(doc.content)
           setContextRequiresEditToken(doc.requiresEditToken)
+          clearBrowserSharedContextCache()
           setContextBanner({
             level: 'ok',
-            message: `Đã lưu CONTEXT trên server (${new Date(doc.updatedAt).toLocaleString('vi-VN')}).`,
+            message: `Đã lưu CONTEXT (data/ + public/CONTEXT.md). Inbox AI & Training dùng chung bản này; cache Gemini server đã làm mới.`,
           })
         }}
       />

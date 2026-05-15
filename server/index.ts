@@ -1,8 +1,9 @@
 import { createServer } from 'node:http'
 import { contextEditTokenRequired, verifyContextEditToken } from './context-auth.ts'
+import { resolveGeminiContextCacheTtlSeconds } from './context-cache-ttl.ts'
 import {
-  clearSharedContextCacheStore,
   ensureSharedContextCache,
+  purgeAllSharedContextCachesRemote,
 } from './context-cache-store.ts'
 import {
   ensureContextFile,
@@ -18,7 +19,7 @@ import { applySecurityHeaders } from './security-headers.ts'
 import { canServeStaticBuild, tryServeStatic } from './static.ts'
 import { tryProxyUpstream } from './upstream-proxy.ts'
 import { useVertexGeminiBackend } from './vertex-auth.ts'
-import { handleFacebookApi } from './facebook.ts'
+import { handleFacebookApi, startFacebookAiUnrepliedSweep } from './facebook.ts'
 
 loadEnvFile()
 assertProductionEnv()
@@ -28,7 +29,6 @@ const PORT =
   Number(process.env.CONTEXT_CACHE_SERVER_PORT) ||
   8787
 const HOST = process.env.CONTEXT_CACHE_SERVER_HOST?.trim() || '0.0.0.0'
-const DEFAULT_TTL_S = Number(process.env.GEMINI_CONTEXT_CACHE_TTL_S) || 3600
 const DEFAULT_MODEL = process.env.VITE_GEMINI_MODEL?.trim() || 'gemini-3.1-flash-lite'
 const PUBLIC_URL = process.env.APP_PUBLIC_URL?.trim() || ''
 const MAX_CONTEXT_CHARS = Number(process.env.CONTEXT_MAX_CHARS) || 500_000
@@ -63,6 +63,7 @@ const server = createServer((req, res) => {
         geminiBackend,
         geminiServerReady: geminiBackend === 'vertex' || Boolean(getServerGeminiApiKey()),
         geminiProxyKeyInjected: Boolean(getServerGeminiApiKey()),
+        geminiContextCacheTtlS: resolveGeminiContextCacheTtlSeconds(),
       })
       return
     }
@@ -92,7 +93,7 @@ const server = createServer((req, res) => {
       }
 
       const doc = await writeContextDocument(body.content)
-      clearSharedContextCacheStore()
+      await purgeAllSharedContextCachesRemote(getServerGeminiApiKey())
       sendJson(res, 200, contextApiPayload(doc))
       return
     }
@@ -128,13 +129,38 @@ const server = createServer((req, res) => {
       }
 
       const model = body.model?.trim() || DEFAULT_MODEL
-      const ttlSeconds = Number(body.ttlSeconds) || DEFAULT_TTL_S
+      const rawTtl = body.ttlSeconds
+      const n = typeof rawTtl === 'number' ? rawTtl : Number(rawTtl)
+      const ttlSeconds =
+        Number.isFinite(n) && n > 0
+          ? Math.min(86_400, Math.max(60, Math.floor(n)))
+          : resolveGeminiContextCacheTtlSeconds()
       try {
         const result = await ensureSharedContextCache(apiKey, model, systemPrompt, ttlSeconds)
         sendJson(res, 200, result)
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)
         sendJson(res, 502, { error: msg })
+      }
+      return
+    }
+
+    if (req.method === 'POST' && url === '/api/context-cache/purge') {
+      if (!verifyContextEditToken(req)) {
+        sendJson(res, 401, { error: 'Sai hoặc thiếu mã chỉnh sửa CONTEXT.' })
+        return
+      }
+      const apiKey = getServerGeminiApiKey()
+      if (!useVertexGeminiBackend() && !apiKey) {
+        sendJson(res, 500, { error: 'Thiếu GEMINI_API_KEY trên server.' })
+        return
+      }
+      try {
+        const deleted = await purgeAllSharedContextCachesRemote(apiKey)
+        sendJson(res, 200, { ok: true, deletedRemote: deleted })
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        sendJson(res, 500, { error: msg })
       }
       return
     }
@@ -150,6 +176,27 @@ const server = createServer((req, res) => {
   })
 })
 
+function scheduleRemoteContextCachePurgeOnShutdown(): void {
+  const raw = process.env.GEMINI_CONTEXT_CACHE_PURGE_ON_SHUTDOWN?.trim().toLowerCase()
+  const explicitOff = raw === '0' || raw === 'false' || raw === 'no'
+  const explicitOn = raw === '1' || raw === 'true' || raw === 'yes'
+  const defaultOn = process.env.NODE_ENV !== 'production'
+  if (explicitOff || (!explicitOn && !defaultOn)) return
+
+  const run = () => {
+    const key = getServerGeminiApiKey()
+    void purgeAllSharedContextCachesRemote(key).then((count) => {
+      if (count > 0) {
+        console.log(`[context-cache] Đã xoá ${count} cachedContent trên Google (shutdown).`)
+      }
+    })
+  }
+  process.once('SIGINT', run)
+  process.once('SIGTERM', run)
+}
+
+scheduleRemoteContextCachePurgeOnShutdown()
+
 void ensureContextFile().then(() => {
   server.listen(PORT, HOST, () => {
     const modes = ['api', 'proxy']
@@ -161,5 +208,6 @@ void ensureContextFile().then(() => {
         '[context-cache] CONTEXT_EDITOR_TOKEN chưa đặt — ai cũng có thể PUT /api/context. Đặt token trước khi mở domain.',
       )
     }
+    startFacebookAiUnrepliedSweep()
   })
 })
