@@ -754,12 +754,12 @@ export async function handleFacebookApi(req: IncomingMessage, res: ServerRespons
         return true
       }
     }
-    const ok = await patchFacebookPage(pageId, patch)
-    if (!ok) {
+    const page = await patchFacebookPage(pageId, patch)
+    if (!page) {
       json(res, 404, { ok: false, error: 'Không tìm thấy fanpage hoặc chi nhánh không hợp lệ.' })
       return true
     }
-    json(res, 200, { ok: true })
+    json(res, 200, { ok: true, page })
     return true
   }
 

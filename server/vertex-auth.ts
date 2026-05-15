@@ -19,6 +19,10 @@ type MetadataTokenResponse = {
 
 let cachedToken: { accessToken: string; expiresAt: number } | null = null
 
+export function clearVertexAccessTokenCache(): void {
+  cachedToken = null
+}
+
 function base64Url(input: string): string {
   return Buffer.from(input)
     .toString('base64')
@@ -57,7 +61,7 @@ function createJwt(sa: ServiceAccountKey): string {
   return `${unsigned}.${signature.replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '')}`
 }
 
-async function getMetadataAccessToken(): Promise<string> {
+async function getMetadataAccessToken(): Promise<{ token: string; expiresIn?: number }> {
   const res = await fetch(METADATA_TOKEN_URL, {
     method: 'GET',
     headers: { 'Metadata-Flavor': 'Google' },
@@ -68,7 +72,7 @@ async function getMetadataAccessToken(): Promise<string> {
   const data = JSON.parse(raw) as MetadataTokenResponse
   if (!data.access_token) throw new Error('Metadata token response thiếu access_token.')
 
-  return data.access_token
+  return { token: data.access_token, expiresIn: data.expires_in }
 }
 
 export function useVertexGeminiBackend(): boolean {
@@ -102,7 +106,9 @@ export async function getVertexAccessToken(): Promise<string> {
     token = data.access_token
     expiresIn = data.expires_in ?? expiresIn
   } else {
-    token = await getMetadataAccessToken()
+    const metadataToken = await getMetadataAccessToken()
+    token = metadataToken.token
+    expiresIn = metadataToken.expiresIn ?? expiresIn
   }
 
   cachedToken = {

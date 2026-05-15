@@ -22,12 +22,12 @@ export const BRANCH_PAGES: BranchPage[] = [
   { id: 9, name: 'CN 9 - Thủ Dầu Một', address: '238 Đại Lộ Bình Dương, Thủ Dầu Một', hotline: '0935311111' },
   { id: 10, name: 'CN 10 - Bến Cát', address: 'KDC Golden Centercity, Bến Cát', hotline: '0935311111' },
   { id: 11, name: 'CN 11 - Thuận An', address: 'Ô94, DC30, Đường D1, KDC Vietsing, Thuận An', hotline: '0935311111' },
-  { id: 12, name: 'CN 12 - Tây Ninh', address: '24 Lãnh Binh Tòng, Trảng Bàng, Tây Ninh', hotline: '0935311111' },
+  { id: 12, name: 'CN 12 - TÚ KA WA TRẢNG BÀNG', address: '24 Lãnh Binh Tòng, Trảng Bàng, Tây Ninh', hotline: '0935311111' },
   { id: 13, name: 'CN 13 - Biên Hòa', address: '1118 Nguyễn Ái Quốc, Tân Phong, Biên Hòa', hotline: '0935311111' },
   { id: 14, name: 'CN 14 - Phú Quốc', address: '120 Đường 30/4, TT Dương Đông, Phú Quốc', hotline: '0935311111' },
   { id: 15, name: 'CN 15 - Đà Lạt', address: '33 Phan Bội Châu, Phường 1, TP Đà Lạt', hotline: '0935311111' },
   { id: 16, name: 'CN 16 - Bình Phước', address: '483 Quốc Lộ 14, TX Đồng Xoài, Bình Phước', hotline: '0935311111' },
-  { id: 17, name: 'CN 17 - Tây Ninh', address: '953 Cách Mạng Tháng 8, TP Tây Ninh', hotline: '0935311111' },
+  { id: 17, name: 'CN 17 - TÚ KA WA TÂY NINH', address: '953 Cách Mạng Tháng 8, TP Tây Ninh', hotline: '0935311111' },
   { id: 18, name: 'CN 18 - Vũng Tàu', address: '496 Trương Công Định, Phường Vũng Tàu, TP.HCM', hotline: '0935311111' },
   { id: 19, name: 'CN 19 - Nha Trang', address: '150 Nguyễn Thị Minh Khai, Phường Nha Trang, Khánh Hòa', hotline: '0935311111' },
   { id: 20, name: 'CN 20 - An Giang', address: '125 Trần Quang Khải, Phường Rạch Giá, An Giang', hotline: '0935311111' },
@@ -59,7 +59,14 @@ export const IMAGE_SAMPLE_MARKER_RE = /\[\[\s*SEND_IMAGE\s*:\s*([a-z0-9_-]+)\s*\
 export const IMAGE_SAMPLE_ALIASES: Record<string, string[]> = {
   moi_noi_long_vu: ['moi noi long vu', 'hinh moi noi', 'mau moi noi'],
   noi_toc: ['noi toc', 'mau noi toc', 'toc noi'],
-  noi_long_vu_den_chum_den: ['noi long vu den', 'chum toc den', 'toc noi mau den'],
+  noi_long_vu_den_chum_den: [
+    'noi long vu den',
+    'chum toc den',
+    'toc noi den',
+    'toc noi mau den',
+    'noi toc den',
+    'noi toc mau den',
+  ],
   toc_ngan_bob_tem: ['toc ngan', 'bob', 'toc tem', 'mau tem'],
   mai_thua: ['mai thua'],
   mai_bay: ['mai bay'],
@@ -82,6 +89,83 @@ export const IMAGE_SAMPLE_ALIASES: Record<string, string[]> = {
   mau_balayage: ['balayage'],
   mau_babylight: ['baby light', 'babylight'],
   nhuom_sang_khong_tay: ['nhuom sang khong can tay', 'mau sang khong tay', 'nhuom khong tay'],
+}
+
+export function isExplicitImageSampleRequest(text: string): boolean {
+  const lower = text.toLowerCase()
+  if (/(ảnh|hình|hinh|photo|image|tham khảo|tham khao|xem|gửi|gui|cho xem|có hình|co hinh|có ảnh|co anh)/i.test(lower)) {
+    return true
+  }
+
+  // Keep accents here: after normalization, "mẫu" and "màu" both become "mau".
+  return /\bmẫu\b/i.test(lower)
+}
+
+function hasAnyWord(text: string, words: string[]): boolean {
+  return words.some((word) => new RegExp(`\\b${word}\\b`).test(text))
+}
+
+function inferPrimaryImageSampleKey(text: string): string | null {
+  const normalized = normalizeSearchText(text)
+  if (!normalized) return null
+
+  const has = (word: string) => new RegExp(`\\b${word}\\b`).test(normalized)
+  const hasAny = (words: string[]) => hasAnyWord(normalized, words)
+  const isShort = hasAny(['ngan', 'ngang vai', 'bob', 'tem'])
+  const isLong = hasAny(['dai', 'qua vai', 'ngang lung', 'cham lung', 'cham mong', 'toi mong'])
+  const hasChemicalService = hasAny(['uon', 'duoi', 'nhuom', 'noi'])
+
+  if (normalized.includes('moi noi long vu')) return 'moi_noi_long_vu'
+  if (
+    normalized.includes('noi long vu den') ||
+    normalized.includes('chum toc den') ||
+    normalized.includes('toc noi den') ||
+    normalized.includes('toc noi mau den') ||
+    normalized.includes('noi toc den') ||
+    normalized.includes('noi toc mau den')
+  ) {
+    return 'noi_long_vu_den_chum_den'
+  }
+  if (normalized.includes('noi toc') || normalized.includes('toc noi')) return 'noi_toc'
+
+  if (has('phu') && has('bac') && has('tram')) return 'phu_bac_mau_tram'
+  if (normalized.includes('nhuom phu bac') || (has('phu') && has('bac'))) return 'nhuom_phu_bac'
+  if (isSilverCoverageContext(normalized)) return 'toc_bac'
+
+  if (normalized.includes('mai thua')) return 'mai_thua'
+  if (normalized.includes('mai bay')) return 'mai_bay'
+  if (normalized.includes('mai phap')) return 'mai_phap'
+  if (normalized.includes('mai ngang')) return 'mai_ngang'
+
+  if (has('duoi') && isShort) return 'duoi_ngan'
+  if (has('duoi') && isLong) return 'duoi_dai'
+  if (normalized.includes('uon cup')) return 'uon_cup'
+  if (normalized.includes('uon song') && isShort) return 'uon_song_ngan'
+  if (normalized.includes('uon song') && isLong) return 'uon_song_dai'
+  if (hasAny(['hippie', 'hippi', 'hippe']) || normalized.includes('xu mi')) return 'uon_hippie'
+  if (normalized.includes('xoan tang')) return 'uon_xoan_tang'
+  if ((normalized.includes('xoan luoi') || normalized.includes('uon loi')) && isShort) {
+    return 'uon_xoan_luoi_ngan'
+  }
+  if ((normalized.includes('xoan luoi') || normalized.includes('uon loi')) && isLong) {
+    return 'uon_xoan_luoi_dai'
+  }
+
+  if ((normalized.includes('toc ngan') || has('bob') || has('tem')) && !hasChemicalService) {
+    return 'toc_ngan_bob_tem'
+  }
+
+  if (has('balayage')) return 'mau_balayage'
+  if (normalized.includes('baby light') || has('babylight')) return 'mau_babylight'
+  if (normalized.includes('sang khong') || normalized.includes('khong can tay')) {
+    return 'nhuom_sang_khong_tay'
+  }
+  if (normalized.includes('mau thoi trang') || normalized.includes('mau noi') || has('ca tinh')) {
+    return 'mau_thoi_trang'
+  }
+  if (normalized.includes('mau tram') || normalized.includes('mau toi nhe')) return 'mau_tram'
+
+  return null
 }
 
 export function normalizeSearchText(text: string): string {
@@ -204,9 +288,9 @@ export function buildImageSampleCatalogPrompt(groups: ImageSampleGroup[]): strin
   return [
     '--- IMAGE SAMPLE ROUTER (không chứa URL) ---',
     'App có database URL ảnh mẫu riêng, URL không nằm trong prompt để tiết kiệm chi phí.',
-    'Khi tư vấn dịch vụ/kiểu tóc có nhóm ảnh phù hợp, chủ động thêm marker đúng nhóm ở một dòng riêng: [[SEND_IMAGE:key]].',
+    'Khi nhu cầu khách khớp rõ với đúng một nhóm ảnh, có thể chủ động thêm marker đúng nhóm ở một dòng riêng: [[SEND_IMAGE:key]].',
     'Không tự viết URL, không giải thích marker cho khách. App sẽ ẩn marker và thay bằng link ảnh thật.',
-    'Dùng tối đa 1-2 marker/lượt; chọn nhóm sát nhất với nhu cầu khách.',
+    'Dùng tối đa 1 marker/lượt; chỉ dùng khi chắc đúng loại tóc/dịch vụ/màu khách đang hỏi, nếu mơ hồ thì không gửi ảnh.',
     'Khi ngữ cảnh là phủ bạc / tóc bạc / hòa bạc / nuôi bạc, chỉ dùng nhuom_phu_bac, phu_bac_mau_tram hoặc toc_bac; tuyệt đối không dùng mau_tram.',
     'Các key ảnh mẫu:',
     ...groups.map((group) => `- ${group.key}: ${group.label} (${group.usage})`),
@@ -234,7 +318,10 @@ export function compactLines(text: string): string {
 
 export function inferImageSampleKeys(text: string, groups: ImageSampleGroup[]): string[] {
   const normalized = normalizeSearchText(text)
-  if (!/\b(anh|hinh|mau|tham khao|xem|gui)\b/.test(normalized)) return []
+  const primaryKey = inferPrimaryImageSampleKey(text)
+  if (primaryKey && groups.some((group) => group.key === primaryKey)) return [primaryKey]
+  if (!isExplicitImageSampleRequest(text)) return []
+
   const keys: string[] = []
   for (const group of groups) {
     const aliases = IMAGE_SAMPLE_ALIASES[group.key] ?? [
@@ -244,7 +331,7 @@ export function inferImageSampleKeys(text: string, groups: ImageSampleGroup[]): 
     if (aliases.some((alias) => alias && normalized.includes(alias))) {
       keys.push(group.key)
     }
-    if (keys.length >= 2) break
+    if (keys.length >= 1) break
   }
   return keys
 }
@@ -275,11 +362,16 @@ export function expandModelImageSampleMarkers(
     if (groupsByKey.has(key) && !markerKeys.includes(key)) markerKeys.push(key)
     return ''
   })
-  const inferSource = opts?.inferImageKeysFromModelOnly ? rawText : `${triggerText}\n${rawText}`
-  const autoKeys =
-    markerKeys.length > 0 ? [] : inferImageSampleKeys(inferSource, groups)
+  const allowedKeys = filterImageSampleKeysForContext(
+    inferImageSampleKeys(triggerText, groups),
+    triggerText,
+  )
+  const validMarkerKeys = allowedKeys.length
+    ? markerKeys.filter((key) => allowedKeys.includes(key))
+    : []
+  const autoKeys = validMarkerKeys.length > 0 ? [] : allowedKeys
   const keys = filterImageSampleKeysForContext(
-    [...markerKeys, ...autoKeys].filter((key, index, arr) => arr.indexOf(key) === index),
+    [...validMarkerKeys, ...autoKeys].filter((key, index, arr) => arr.indexOf(key) === index),
     `${triggerText}\n${rawText}`,
   )
   if (!keys.length) {
@@ -295,15 +387,18 @@ export function expandModelImageSampleMarkers(
     const group = groupsByKey.get(key)
     if (!group) continue
     const resolvedUrls = group.urls
+      .slice(0, 8)
       .map((u) => resolveImageSampleUrl(u, opts?.imageBaseUrl))
       .filter((u) => u.length > 0)
     displayAdditions.push([`Ảnh mẫu ${group.label}:`, ...resolvedUrls].join('\n'))
     for (const u of resolvedUrls) {
       const t = u.trim()
       if (!t || seenUrl.has(t)) continue
+      if (imageUrls.length >= 8) break
       seenUrl.add(t)
       imageUrls.push(t)
     }
+    if (imageUrls.length >= 8) break
   }
 
   return {
@@ -329,6 +424,14 @@ export function isSalonPlaceholderMessageText(text: string): boolean {
 }
 
 export function inferBranchForFacebookPage(page: { id: string; name: string }, pageOrderIndex: number): BranchPage {
+  const normalizedName = normalizeSearchText(page.name)
+  if (normalizedName.includes('trang bang')) {
+    return BRANCH_PAGES.find((b) => b.id === 12) ?? BRANCH_PAGES[0]
+  }
+  if (normalizedName.includes('tay ninh')) {
+    return BRANCH_PAGES.find((b) => b.id === 17) ?? BRANCH_PAGES[0]
+  }
+
   const m = page.name.match(/CN\s*(\d{1,2})\b/i)
   if (m) {
     const n = Math.min(BRANCH_PAGES.length, Math.max(1, parseInt(m[1], 10)))

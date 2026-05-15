@@ -235,6 +235,7 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
 
   const [contextMd, setContextMd] = useState('')
   const [imageSamplesMd, setImageSamplesMd] = useState('')
+  const [imageSamplesBaseUrl, setImageSamplesBaseUrl] = useState('')
   const [contextBanner, setContextBanner] = useState<ContextBanner>(null)
   const [contextFromServer, setContextFromServer] = useState(false)
   const [contextRequiresEditToken, setContextRequiresEditToken] = useState(false)
@@ -290,10 +291,12 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
 
   const loadContext = useCallback(async () => {
     setContextBanner(null)
-    const loadImageSamples = async (): Promise<string> => {
+    const loadImageSamples = async (): Promise<{ content: string; baseUrl: string }> => {
       try {
         const serverDoc = await fetchServerImageSamples()
-        if (serverDoc) return serverDoc.content
+        if (serverDoc) {
+          return { content: serverDoc.content, baseUrl: serverDoc.baseUrl?.trim() ?? '' }
+        }
       } catch {
         // Fall back to the static public file below.
       }
@@ -301,13 +304,13 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
       try {
         const res = await fetch('/IMAGE_SAMPLES.md', { cache: 'no-store' })
         if (!res.ok) throw new Error(`${res.status}`)
-        return await res.text()
+        return { content: await res.text(), baseUrl: '' }
       } catch {
         try {
           const { default: fallback } = await import('./context/IMAGE_SAMPLES.fallback.md?raw')
-          return fallback
+          return { content: fallback, baseUrl: '' }
         } catch {
-          return ''
+          return { content: '', baseUrl: '' }
         }
       }
     }
@@ -317,7 +320,9 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
       if (serverDoc) {
         setContextFromServer(true)
         setContextRequiresEditToken(serverDoc.requiresEditToken)
-        setImageSamplesMd(await loadImageSamples())
+        const imageSamples = await loadImageSamples()
+        setImageSamplesMd(imageSamples.content)
+        setImageSamplesBaseUrl(imageSamples.baseUrl)
         setContextMd(serverDoc.content)
         return
       }
@@ -334,12 +339,16 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
     try {
       const res = await fetch('/CONTEXT.md', { cache: 'no-store' })
       if (!res.ok) throw new Error(`${res.status}`)
-      setImageSamplesMd(await loadImageSamples())
+      const imageSamples = await loadImageSamples()
+      setImageSamplesMd(imageSamples.content)
+      setImageSamplesBaseUrl(imageSamples.baseUrl)
       setContextMd(await res.text())
     } catch {
       try {
         const { default: fallback } = await import('./context/CONTEXT.fallback.md?raw')
-        setImageSamplesMd(await loadImageSamples())
+        const imageSamples = await loadImageSamples()
+        setImageSamplesMd(imageSamples.content)
+        setImageSamplesBaseUrl(imageSamples.baseUrl)
         setContextMd(fallback)
         setContextBanner({
           level: 'warn',
@@ -348,6 +357,7 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
         })
       } catch {
         setImageSamplesMd('')
+        setImageSamplesBaseUrl('')
         setContextMd('')
         setContextBanner({
           level: 'error',
@@ -675,13 +685,16 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
 
           const finalText =
             result.text.trim() || streamingRef.current?.getText().trim() || result.text
-          const lastCustomerText = [...historyForApi]
-            .reverse()
-            .find((turn) => turn.role === 'user')?.text ?? ''
+          const recentCustomerText = historyForApi
+            .filter((turn) => turn.role === 'user')
+            .slice(-4)
+            .map((turn) => turn.text)
+            .join('\n')
           const imageExpanded = expandModelImageSampleMarkers(
             finalText,
             imageSampleGroups,
-            lastCustomerText,
+            recentCustomerText,
+            { imageBaseUrl: imageSamplesBaseUrl },
           )
           finalizeBatchedReply(imageExpanded.apiText, result.usage, imageExpanded.displayText)
 

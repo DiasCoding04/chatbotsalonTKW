@@ -1718,6 +1718,18 @@
   color: var(--accent-strong);
 }
 
+.tag-line em {
+  border: 1px solid color-mix(in srgb, var(--muted) 18%, transparent);
+  background: color-mix(in srgb, var(--muted) 12%, var(--surface));
+  color: var(--text-soft);
+}
+
+.ad-source-mini {
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface));
+  color: var(--accent-strong);
+}
+
 .status-pill {
   background: color-mix(in srgb, var(--success) 14%, var(--surface));
   color: color-mix(in srgb, var(--success) 80%, #1a1a1a);
@@ -1900,8 +1912,8 @@
 
 :root[data-theme='dark'] .page-row.active,
 :root[data-theme='dark'] .conversation-row.active {
-  background: color-mix(in srgb, var(--accent-soft) 38%, var(--surface));
-  border-color: color-mix(in srgb, var(--accent) 38%, var(--border));
+  background: color-mix(in srgb, var(--surface-2) 84%, var(--surface));
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
 }
 
 :root[data-theme='dark'] .page-row-main strong,

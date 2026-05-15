@@ -7,6 +7,7 @@ export type ContextApiDocument = {
 export type ImageSamplesApiDocument = {
   content: string
   updatedAt: string
+  baseUrl?: string
 }
 
 export type HealthApiPayload = {

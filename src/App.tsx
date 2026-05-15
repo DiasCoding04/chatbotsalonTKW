@@ -625,14 +625,15 @@ async function patchFacebookConversationApi(
 async function patchFacebookPageApi(
   pageId: string,
   patch: { defaultBranchPageId?: number | null; aiMasterEnabled?: boolean },
-): Promise<void> {
+): Promise<FacebookStorePage | null> {
   const res = await fetch('/api/facebook/page', {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ pageId, ...patch }),
   })
-  const body = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string }
+  const body = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string; page?: FacebookStorePage }
   if (!res.ok || body.ok === false) throw new Error(body.error || `Không cập nhật được fanpage (${res.status}).`)
+  return body.page ?? null
 }
 
 async function fetchFacebookInboxData(): Promise<{ pages: Page[]; conversations: Conversation[] }> {
@@ -923,7 +924,7 @@ function App() {
     void (async () => {
       try {
         const branchVal = pageModalBranch === '' ? null : Number(pageModalBranch)
-        await patchFacebookPageApi(pageSettingsPageId, {
+        const savedPage = await patchFacebookPageApi(pageSettingsPageId, {
           defaultBranchPageId: branchVal,
           aiMasterEnabled: pageModalMasterAi,
         })
@@ -932,8 +933,11 @@ function App() {
             if (p.id !== pageSettingsPageId) return p
             return {
               ...p,
-              aiMasterEnabled: pageModalMasterAi,
-              defaultBranchPageId: pageModalBranch === '' ? undefined : Number(pageModalBranch),
+              avatarUrl: savedPage?.avatarUrl ?? p.avatarUrl,
+              connected: savedPage?.connected ?? p.connected,
+              name: savedPage?.name ?? p.name,
+              aiMasterEnabled: savedPage?.aiMasterEnabled,
+              defaultBranchPageId: savedPage?.defaultBranchPageId,
             }
           }),
         )
@@ -1532,7 +1536,7 @@ function App() {
                     <option value="">Tự động (theo tên fanpage)</option>
                     {BRANCH_PAGES.map((b) => (
                       <option key={b.id} value={String(b.id)}>
-                        {b.name}
+                        {b.name} - {b.address}
                       </option>
                     ))}
                   </select>

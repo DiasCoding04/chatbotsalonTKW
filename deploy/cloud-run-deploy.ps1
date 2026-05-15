@@ -8,9 +8,16 @@ param(
 
 $gcloudCmd = Get-Command gcloud -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue
 if (-not $gcloudCmd) {
-  $fallbackPath = 'C:\Program Files (x86)\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd'
-  if (Test-Path $fallbackPath) {
-    $gcloudCmd = $fallbackPath
+  $fallbackPaths = @(
+    'C:\Program Files (x86)\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd',
+    'C:\Program Files\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd',
+    "$env:LOCALAPPDATA\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd"
+  )
+  foreach ($fallbackPath in $fallbackPaths) {
+    if (Test-Path $fallbackPath) {
+      $gcloudCmd = $fallbackPath
+      break
+    }
   }
 }
 

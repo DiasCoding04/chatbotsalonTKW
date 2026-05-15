@@ -274,6 +274,21 @@ function lastUserTurnPlainText(history: ChatTurn[]): string {
   return ''
 }
 
+function recentUserTurnsPlainText(history: ChatTurn[], maxTurns = 4): string {
+  const lines: string[] = []
+  for (let i = history.length - 1; i >= 0 && lines.length < maxTurns; i--) {
+    const h = history[i]
+    if (h.role !== 'user') continue
+    for (const p of h.parts) {
+      if ('text' in p && typeof p.text === 'string' && p.text.trim()) {
+        lines.unshift(p.text.trim())
+        break
+      }
+    }
+  }
+  return lines.join('\n')
+}
+
 /** Mỗi dòng non-empty = 1 tin Messenger riêng (giới hạn độ dài 1 tin). */
 function splitAiReplyIntoFacebookMessages(text: string): string[] {
   return text
@@ -523,8 +538,8 @@ async function executeFacebookAiReply(
       contextCacheHit,
     })
 
-    const lastUser = lastUserTurnPlainText(history)
-    const expanded = expandModelImageSampleMarkers(raw, groups, lastUser, {
+    const recentUserText = recentUserTurnsPlainText(history)
+    const expanded = expandModelImageSampleMarkers(raw, groups, recentUserText, {
       inferImageKeysFromModelOnly: true,
       imageBaseUrl: IMAGE_SAMPLES_BASE_URL,
     })

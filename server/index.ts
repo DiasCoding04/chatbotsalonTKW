@@ -102,6 +102,7 @@ const server = createServer((req, res) => {
       sendJson(res, 200, {
         content: doc.content,
         updatedAt: doc.updatedAt,
+        baseUrl: process.env.IMAGE_SAMPLES_BASE_URL?.trim() || '',
       })
       return
     }

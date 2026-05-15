@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
-import { getVertexAccessToken } from './vertex-auth.ts'
+import { clearVertexAccessTokenCache, getVertexAccessToken } from './vertex-auth.ts'
 import {
   BRANCH_PAGES,
   isSalonPlaceholderMessageText,
@@ -172,6 +172,29 @@ function firestoreDocUrl(): string {
   return `https://firestore.googleapis.com/v1/${firestoreDocName()}`
 }
 
+async function fetchFirestoreWithAuth(url: string, init: RequestInit = {}): Promise<Response> {
+  let token = await getVertexAccessToken()
+  let res = await fetch(url, {
+    ...init,
+    headers: {
+      ...init.headers,
+      Authorization: `Bearer ${token}`,
+    },
+  })
+  if (res.status !== 401) return res
+
+  clearVertexAccessTokenCache()
+  token = await getVertexAccessToken()
+  res = await fetch(url, {
+    ...init,
+    headers: {
+      ...init.headers,
+      Authorization: `Bearer ${token}`,
+    },
+  })
+  return res
+}
+
 async function readStoreFromFile(): Promise<FacebookStore> {
   try {
     const raw = await readFile(FACEBOOK_STORE_FILE, 'utf8')
@@ -193,10 +216,7 @@ async function writeStoreToFile(store: FacebookStore): Promise<void> {
 
 async function readStoreFromFirestore(): Promise<FacebookStore | null> {
   if (!FIRESTORE_PROJECT_ID) return null
-  const token = await getVertexAccessToken()
-  const res = await fetch(firestoreDocUrl(), {
-    headers: { Authorization: `Bearer ${token}` },
-  })
+  const res = await fetchFirestoreWithAuth(firestoreDocUrl())
   if (res.status === 404) return null
   const raw = await res.text()
   if (!res.ok) throw new Error(raw || `Firestore read failed (${res.status})`)
@@ -212,17 +232,15 @@ async function readStoreFromFirestore(): Promise<FacebookStore | null> {
 
 async function writeStoreToFirestore(store: FacebookStore): Promise<void> {
   if (!FIRESTORE_PROJECT_ID) throw new Error('Thiếu FIRESTORE project id cho Facebook store.')
-  const token = await getVertexAccessToken()
   const payload = {
     name: firestoreDocName(),
     fields: {
       json: { stringValue: JSON.stringify(store) },
     },
   }
-  const res = await fetch(firestoreDocUrl(), {
+  const res = await fetchFirestoreWithAuth(firestoreDocUrl(), {
     method: 'PATCH',
     headers: {
-      Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json; charset=utf-8',
     },
     body: JSON.stringify(payload),
@@ -515,10 +533,10 @@ export async function patchFacebookConversation(
 export async function patchFacebookPage(
   pageId: string,
   patch: { defaultBranchPageId?: number | null; aiMasterEnabled?: boolean },
-): Promise<boolean> {
+): Promise<FacebookPageRecord | null> {
   const store = await readStore()
   const page = store.pages.find((p) => p.id === pageId)
-  if (!page) return false
+  if (!page) return null
   if (typeof patch.aiMasterEnabled === 'boolean') {
     page.aiMasterEnabled = patch.aiMasterEnabled
   }
@@ -528,12 +546,12 @@ export async function patchFacebookPage(
     } else if (typeof patch.defaultBranchPageId === 'number' && BRANCH_IDS.has(patch.defaultBranchPageId)) {
       page.defaultBranchPageId = patch.defaultBranchPageId
     } else {
-      return false
+      return null
     }
   }
   store.updatedAt = new Date().toISOString()
   await writeStore(store)
-  return true
+  return page
 }
 
 /** Cộng dồn chi phí ước tính và ghi nhận cache hit cho lần gọi Gemini gần nhất. */
@@ -558,7 +576,15 @@ export async function saveFacebookPages(pages: FacebookPageRecord[]): Promise<Fa
   const merged = new Map(store.pages.map((page) => [page.id, page]))
   for (const page of pages) {
     const prev = merged.get(page.id)
-    merged.set(page.id, { ...(prev ?? {}), ...page, connected: true })
+    merged.set(page.id, {
+      ...(prev ?? {}),
+      id: page.id,
+      name: page.name,
+      avatarUrl: page.avatarUrl,
+      connected: true,
+      defaultBranchPageId: prev?.defaultBranchPageId,
+      aiMasterEnabled: prev?.aiMasterEnabled,
+    })
   }
   store.pages = Array.from(merged.values()).sort((a, b) => a.name.localeCompare(b.name, 'vi'))
   store.updatedAt = new Date().toISOString()
