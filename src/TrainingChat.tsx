@@ -34,9 +34,13 @@ import { fetchServerContext, fetchServerHealth, fetchServerImageSamples } from '
 import {
   BRANCH_PAGES,
   buildSalonSystemPrompt,
+  buildSalonSystemPromptStatic,
+  DEFAULT_MAX_IMAGE_SAMPLES_PER_REPLY,
+  prependRealtimeContextTurns,
   expandModelImageSampleMarkers,
   mergeContextWithImageSampleCatalog,
   parseImageSampleGroups,
+  resolveApprovedImageSampleKeys,
 } from '../shared/salon-ai-context.ts'
 
 const buildSystemPrompt = buildSalonSystemPrompt
@@ -253,6 +257,7 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
   const [ctxMetrics, setCtxMetrics] = useState<CtxTokenMetrics | null>(null)
   const [lastPerf, setLastPerf] = useState<LastPerf | null>(null)
   const [cacheStatus, setCacheStatus] = useState<CacheStatus>({ kind: 'idle' })
+  const [lastCachedTokens, setLastCachedTokens] = useState<number | null>(null)
   const [waitModeEnabled, setWaitModeEnabled] = useState(false)
   const [selectedBranchId, setSelectedBranchId] = useState(1)
 
@@ -404,10 +409,17 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
     () => buildSystemPrompt(promptContextMd, selectedBranch),
     [promptContextMd, selectedBranch],
   )
+  /** Cache API: prompt tĩnh (không đổi theo phút) — tránh tạo hàng chục cache trên Vertex. */
+  const cacheSystemPrompt = useMemo(
+    () => buildSalonSystemPromptStatic(promptContextMd, selectedBranch),
+    [promptContextMd, selectedBranch],
+  )
   const contextCacheFingerprint = useMemo(
     () =>
-      isGemini && systemPrompt.trim() ? buildContextCacheFingerprint(model, systemPrompt) : null,
-    [isGemini, model, systemPrompt],
+      isGemini && cacheSystemPrompt.trim()
+        ? buildContextCacheFingerprint(model, cacheSystemPrompt)
+        : null,
+    [isGemini, model, cacheSystemPrompt],
   )
 
   /** OpenAI: ước token CONTEXT cục bộ (không gọi API đếm). */
@@ -427,6 +439,11 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
     return () => window.clearTimeout(t)
   }, [isGemini, geminiReady, promptContextMd, apiKey, selectedBranch])
 
+  /** Đổi model / systemPrompt → reset chỉ báo cache hit của lượt trước. */
+  useEffect(() => {
+    setLastCachedTokens(null)
+  }, [isGemini, model, cacheSystemPrompt])
+
   /** Gemini: cache toàn bộ systemPrompt (tiền tố salon + CONTEXT.md) qua Context Cache API. */
   useEffect(() => {
     if (!isGemini) {
@@ -434,7 +451,7 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
       setCacheStatus({ kind: 'idle' })
       return
     }
-    if (!(geminiReady || serverGeminiReady) || !systemPrompt.trim()) {
+    if (!(geminiReady || serverGeminiReady) || !cacheSystemPrompt.trim()) {
       cacheNameRef.current = null
       setCacheStatus({ kind: 'idle' })
       return
@@ -446,7 +463,7 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
 
     void (async () => {
       try {
-        const { name } = await resolveSharedContextCache(apiKey, model, systemPrompt)
+        const { name } = await resolveSharedContextCache(apiKey, model, cacheSystemPrompt)
         if (cancelled) return
         cacheNameRef.current = name
         setCacheStatus({ kind: 'ready', name })
@@ -462,7 +479,7 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
       cancelled = true
       cacheNameRef.current = null
     }
-  }, [isGemini, apiKey, geminiReady, serverGeminiReady, model, systemPrompt])
+  }, [isGemini, apiKey, geminiReady, serverGeminiReady, model, cacheSystemPrompt])
 
   useEffect(() => {
     if (!isGemini || !contextCacheFingerprint) return
@@ -557,12 +574,12 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
     }
     if (cachedContent) return cachedContent
 
-    if (!systemPrompt.trim()) return undefined
+    if (!cacheSystemPrompt.trim()) return undefined
 
     let lastErr: unknown
     for (let i = 0; i < 6; i++) {
       try {
-        const { name } = await resolveSharedContextCache(apiKey, model, systemPrompt)
+        const { name } = await resolveSharedContextCache(apiKey, model, cacheSystemPrompt)
         cacheNameRef.current = name
         setCacheStatus({ kind: 'ready', name })
         return name
@@ -633,7 +650,7 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
     processingRef.current = true
     setLoading(true)
 
-    const historyForApi = buildChatHistoryForApi(messagesRef.current)
+    const historyForApi = prependRealtimeContextTurns(buildChatHistoryForApi(messagesRef.current))
     const streamId = newClientId()
     appendModelPlaceholder(streamId)
     streamingRef.current?.reset()
@@ -683,6 +700,7 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
             .slice(-4)
             .map((turn) => turn.text)
             .join('\n')
+          const approvedImageKeys = resolveApprovedImageSampleKeys(recentCustomerText, imageSampleGroups)
           const imageExpanded = expandModelImageSampleMarkers(
             finalText,
             imageSampleGroups,
@@ -690,7 +708,8 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
             {
               imageBaseUrl: imageSamplesBaseUrl,
               inferImageKeysFromModelOnly: true,
-              maxImagesPerGroup: 3,
+              enforceCustomerApprovedKeys: approvedImageKeys,
+              maxImagesPerGroup: DEFAULT_MAX_IMAGE_SAMPLES_PER_REPLY,
             },
           )
           finalizeBatchedReply(imageExpanded.apiText, result.usage, imageExpanded.displayText)
@@ -705,6 +724,7 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
               totalChatInput: s.totalChatInput + (sysTok != null ? chatIn : 0),
               calls: s.calls + 1,
             }))
+            if (isGemini) setLastCachedTokens(u.cachedTokens ?? 0)
           }
           break
         } catch (e) {
@@ -762,6 +782,7 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
     setMessages([])
     setStats(EMPTY_STATS)
     setLastPerf(null)
+    setLastCachedTokens(null)
     setPendingImages([])
     setAttachError(null)
     setLoading(false)
@@ -823,20 +844,28 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
 
   function CacheChip() {
     if (!isGemini) return null
+
+    const hitSuffix =
+      lastCachedTokens == null
+        ? ''
+        : lastCachedTokens > 0
+          ? ` · hit ${lastCachedTokens} tok`
+          : ' · miss (lượt trước)'
+
     if (cacheStatus.kind === 'idle') {
       return (
         <span
           className="model-strip-meta"
           title="Chưa khởi tạo cache (đang chờ runtime sẵn sàng hoặc chưa có system prompt)."
         >
-          · cache: chưa khởi tạo
+          · cache: chưa khởi tạo{hitSuffix}
         </span>
       )
     }
     if (cacheStatus.kind === 'loading') {
       return (
         <span className="model-strip-meta" title="Đang tạo Context Cache cho systemInstruction">
-          · cache: đang tạo…
+          · cache: đang tạo…{hitSuffix}
         </span>
       )
     }
@@ -844,18 +873,18 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
       return (
         <span
           className="model-strip-meta"
-          title={`Đang dùng Context Cache dùng chung (server): ${cacheStatus.name}. Mỗi tin chỉ gửi message mới, không gửi lại CONTEXT.md.`}
+          title={`Explicit Context Cache active: ${cacheStatus.name}. Lượt vừa rồi cached ${lastCachedTokens ?? '?'} prompt tokens.`}
         >
-          · cache: bật ✓
+          · cache: bật ✓{hitSuffix}
         </span>
       )
     }
     return (
       <span
         className="model-strip-meta"
-        title={`Cache fail (fallback gửi CONTEXT.md inline mỗi tin): ${cacheStatus.message}`}
+        title={`Cache fail (fallback inline systemInstruction): ${cacheStatus.message}`}
       >
-        · cache: tắt (fallback inline)
+        · cache: tắt (fallback inline){hitSuffix}
       </span>
     )
   }

@@ -72,7 +72,20 @@ export function applyVaultToProcessEnv(vault) {
     }
     return entries.length;
 }
-export async function loadFacebookTokenVault() {
+function resolveVaultReadCacheMs() {
+    const raw = process.env.FACEBOOK_TOKEN_VAULT_CACHE_MS?.trim();
+    if (raw === '0')
+        return 0;
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0)
+        return n;
+    return 30_000;
+}
+let vaultMemCache = null;
+export function invalidateFacebookTokenVaultCache() {
+    vaultMemCache = null;
+}
+async function loadFacebookTokenVaultUncached() {
     if (VAULT_BACKEND === 'file') {
         try {
             const raw = await readFile(VAULT_FILE, 'utf8');
@@ -122,11 +135,21 @@ export async function loadFacebookTokenVault() {
         return null;
     }
 }
+export async function loadFacebookTokenVault() {
+    const ttl = resolveVaultReadCacheMs();
+    if (ttl > 0 && vaultMemCache && Date.now() - vaultMemCache.at < ttl) {
+        return vaultMemCache.vault;
+    }
+    const vault = await loadFacebookTokenVaultUncached();
+    vaultMemCache = { vault, at: Date.now() };
+    return vault;
+}
 export async function saveFacebookTokenVault(vault) {
     const payload = JSON.stringify(vault, null, 2);
     if (VAULT_BACKEND === 'file') {
         await mkdir(DATA_DIR, { recursive: true });
         await writeFile(VAULT_FILE, payload, 'utf8');
+        vaultMemCache = { vault, at: Date.now() };
         return;
     }
     if (!FIRESTORE_PROJECT_ID) {
@@ -147,4 +170,5 @@ export async function saveFacebookTokenVault(vault) {
     const raw = await res.text();
     if (!res.ok)
         throw new Error(raw || `Firestore write vault (${res.status})`);
+    vaultMemCache = { vault, at: Date.now() };
 }

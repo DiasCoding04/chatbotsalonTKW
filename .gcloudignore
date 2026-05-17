@@ -31,3 +31,10 @@ data/
 # Optional heavy static assets (rebuild/host separately if needed)
 public/images/samples/
 
+# IMPORTANT: public/CONTEXT.md & public/IMAGE_SAMPLES.md ARE intentionally
+# included so that fresh containers can seed their data/ dir on cold-start.
+# But the deploy script (deploy/cloud-run-deploy.ps1) MUST refresh those two
+# files from the live production /api/context + /api/image-samples first,
+# otherwise the stale local copy will overwrite live-edited context on every
+# new revision. Don't change this without updating that pre-deploy sync.
+

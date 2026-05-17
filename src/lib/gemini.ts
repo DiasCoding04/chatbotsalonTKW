@@ -4,6 +4,12 @@
  *  - Same-origin → KHÔNG có CORS preflight OPTIONS mỗi request.
  *  - Có thể đổi target trong vite.config.ts hoặc thay bằng backend prod.
  */
+import {
+  estimateContextCacheTokens,
+  isContextCacheEligible,
+  isMinimumTokenCacheError,
+} from '../../shared/context-cache-eligibility.ts'
+
 const API_BASE = '/gemini-api/v1beta'
 const PROXY_INJECTS_KEY = import.meta.env.VITE_GEMINI_PROXY_INJECTS_KEY === 'true'
 
@@ -366,7 +372,7 @@ export type CachedContentInfo = {
  *  - Yêu cầu min token của context cache thường thấp hơn CONTEXT.md đầy đủ
  *    của salon (~3k token), nên đủ điều kiện.
  *  - Có TTL — sau TTL cache tự xoá. App tạo lại khi cần.
- *  - Nếu model không hỗ trợ cache → throw → caller fallback sang inline.
+ *  - Dưới 4096 token (ước tính) → throw → caller fallback sang inline.
  */
 export async function createCachedContentWithRetry(
   apiKey: string,
@@ -375,11 +381,24 @@ export async function createCachedContentWithRetry(
   ttlSeconds = 3600,
   attempts = 3,
 ): Promise<CachedContentInfo> {
+  const estimated = estimateContextCacheTokens(systemPrompt)
+  if (!isContextCacheEligible(systemPrompt)) {
+    throw new Error(
+      `Context cache cần ≥4096 token (ước tính ${estimated}). Dùng inline systemInstruction.`,
+    )
+  }
+
   let lastErr: unknown
   for (let i = 0; i < attempts; i++) {
     try {
       return await createCachedContent(apiKey, model, systemPrompt, ttlSeconds)
     } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      if (isMinimumTokenCacheError(msg)) {
+        throw new Error(
+          `Context cache cần ≥4096 token (ước tính ${estimated}). Dùng inline systemInstruction.`,
+        )
+      }
       lastErr = e
       if (i < attempts - 1) {
         await new Promise((resolve) => window.setTimeout(resolve, 800 * (i + 1)))

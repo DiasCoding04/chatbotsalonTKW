@@ -115,9 +115,18 @@ async function resolveServerSharedContextCache(
   if (!res.ok) {
     throw new Error(raw || `${res.status} ${res.statusText}`)
   }
-  const data = JSON.parse(raw) as { name?: string; reused?: boolean; error?: string }
+  const data = JSON.parse(raw) as {
+    mode?: string
+    name?: string | null
+    reused?: boolean
+    error?: string
+    estimatedTokens?: number
+    reason?: string
+  }
   if (data.error) throw new Error(data.error)
-  if (!data.name) throw new Error('Server cache: thiếu name')
+  if (data.mode === 'inline' || !data.name) {
+    return { name: '', reused: false }
+  }
   return { name: data.name, reused: Boolean(data.reused) }
 }
 

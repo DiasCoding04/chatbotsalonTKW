@@ -1,7 +1,7 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, KeyboardEvent, SyntheticEvent } from 'react'
 import './App.css'
-import { BRANCH_PAGES } from '../shared/salon-ai-context.ts'
+import { inferBranchForFacebookPage } from '../shared/salon-ai-context.ts'
 import { TrainingChat } from './TrainingChat'
 
 type TabKey = 'inbox' | 'training'
@@ -202,6 +202,96 @@ function formatInboxAiCostVnd(usd: number | undefined): string {
 const PLACEHOLDER_NO_TEXT = '[Tin nhắn không có nội dung text]'
 const PLACEHOLDER_REFERRAL = '[Khách mở hội thoại từ nguồn referral]'
 
+const INBOX_MESSAGE_PAGE_SIZE = 30
+const CONVERSATION_PAGE_SIZE = 30
+const INBOX_MESSAGE_LOAD_THRESHOLD_PX = 90
+const INBOX_MESSAGE_STICKY_BOTTOM_PX = 140
+const INBOX_POLL_MS_VISIBLE = 15_000
+const INBOX_POLL_MS_HIDDEN = 60_000
+
+function conversationPollFingerprint(c: Conversation): string {
+  const msgs = c.messages
+  const last = msgs[msgs.length - 1]
+  return [
+    c.id,
+    c.lastMessageSortTs ?? 0,
+    msgs.length,
+    last?.id ?? '',
+    last?.time ?? '',
+    c.customer,
+    c.title,
+    c.status,
+    c.aiEnabled,
+    c.aiEstimatedTotalUsd ?? '',
+    c.avatarUrl ?? '',
+  ].join('|')
+}
+
+function mergeInboxConversation(
+  prev: Conversation | undefined,
+  next: Conversation,
+  isSelected: boolean,
+): Conversation {
+  if (!prev) return next
+  if (conversationPollFingerprint(prev) === conversationPollFingerprint(next)) return prev
+  if (isSelected && prev.messages.length > next.messages.length && next.messages.length > 0) {
+    const tail = next.messages
+    const prevTail = prev.messages.slice(-tail.length)
+    if (prevTail.length === tail.length && prevTail.every((m, i) => m.id === tail[i]?.id)) {
+      return { ...next, messages: prev.messages }
+    }
+  }
+  return next
+}
+
+function mergeInboxConversations(
+  prev: Conversation[],
+  next: Conversation[],
+  selectedId: string,
+): Conversation[] {
+  if (!prev.length) return next
+  const prevById = new Map(prev.map((c) => [c.id, c]))
+  const merged = next.map((n) => mergeInboxConversation(prevById.get(n.id), n, n.id === selectedId))
+  if (merged.length !== prev.length) return merged
+  for (let i = 0; i < merged.length; i++) {
+    if (merged[i] !== prev[i]) return merged
+  }
+  return prev
+}
+
+/** Poll delta: chỉ gộp hội thoại đổi / xóa — giữ nguyên phần còn lại trên UI. */
+function mergePartialInboxConversations(
+  prev: Conversation[],
+  patch: Conversation[],
+  removedIds: string[],
+  selectedId: string,
+): Conversation[] {
+  if (!patch.length && !removedIds.length) return prev
+  const removed = new Set(removedIds)
+  let next = removed.size ? prev.filter((c) => !removed.has(c.id)) : prev
+  if (!patch.length) {
+    if (next.length === prev.length) return prev
+    return next
+  }
+  const byId = new Map(next.map((c) => [c.id, c]))
+  let changed = next.length !== prev.length
+  const patchIds = new Set<string>()
+  for (const n of patch) {
+    patchIds.add(n.id)
+    const merged = mergeInboxConversation(byId.get(n.id), n, n.id === selectedId)
+    if (merged !== byId.get(n.id)) changed = true
+    byId.set(n.id, merged)
+  }
+  if (!changed) return prev
+  const updated = next.map((c) => byId.get(c.id) ?? c)
+  for (const n of patch) {
+    if (!next.some((c) => c.id === n.id)) {
+      updated.unshift(byId.get(n.id)!)
+    }
+  }
+  return [...updated].sort((a, b) => (b.lastMessageSortTs ?? 0) - (a.lastMessageSortTs ?? 0))
+}
+
 function isPlaceholderInboxText(text?: string): boolean {
   const t = text?.trim() ?? ''
   return t === PLACEHOLDER_NO_TEXT || t === PLACEHOLDER_REFERRAL
@@ -378,6 +468,7 @@ function referralThumbnailUrl(referral: MessageReferral): string | undefined {
 }
 
 function urlLooksLikeAudioFile(url: string): boolean {
+  if (/\/audioclip[-/]/i.test(url)) return true
   return /\.(mp3|aac|m4a|oga|ogg|opus|wav|weba|amr|3gp|caf)($|\?)/i.test(url.split(/[?#]/)[0])
 }
 
@@ -429,8 +520,8 @@ function metaHostedMediaSrc(original: string): string {
   if (!original.startsWith('http')) return original
   try {
     const h = new URL(original).hostname.toLowerCase()
+    // fbcdn.net thường load trực tiếp tốt, không cần proxy qua server (tránh tốn bandwidth server)
     if (
-      h.endsWith('fbcdn.net') ||
       h === 'facebook.com' ||
       h.endsWith('.facebook.com') ||
       h.endsWith('fb.com') ||
@@ -638,6 +729,74 @@ function MessageMediaGallery({
   )
 }
 
+const InboxMessageBubble = memo(function InboxMessageBubble({
+  message,
+  customerName,
+  pageId,
+}: {
+  message: Message
+  customerName: string
+  pageId: string
+}) {
+  const referralBlock =
+    Boolean(message.referral) &&
+    Boolean(
+      message.referral!.adId ||
+        message.referral!.title ||
+        message.referral!.photoUrl ||
+        message.referral!.videoUrl ||
+        message.referral!.ref ||
+        message.referral!.source,
+    )
+  const hasGallery =
+    (message.imageUrls?.length ?? 0) > 0 ||
+    (message.videoUrls?.length ?? 0) > 0 ||
+    (message.audioUrls?.length ?? 0) > 0
+  const hasStaffImg = Boolean(message.imageUrl)
+  const hasText = Boolean(message.text.trim()) && !isPlaceholderInboxText(message.text)
+  const hasAny = referralBlock || hasGallery || hasStaffImg || hasText
+  const meta = inboxAuthorMeta(message.author, customerName)
+
+  return (
+    <article className={`bubble ${message.author}`}>
+      <span className="bubble-meta">
+        <span className={`author-badge author-badge-${message.author}`}>{meta.badge}</span>
+        <span className="author-label">{meta.label}</span>
+        <span className="bubble-time">{message.time}</span>
+      </span>
+      {referralBlock ? (
+        <div className="bubble-ad-card">
+          {message.referral!.title ? (
+            <strong className="bubble-ad-title">{message.referral!.title}</strong>
+          ) : null}
+          <AdCreativeMedia referral={message.referral!} pageId={pageId} />
+          <div className="bubble-ad-meta">
+            {message.referral!.source ? <span>{message.referral!.source}</span> : null}
+            {message.referral!.type ? <span>{message.referral!.type}</span> : null}
+            {message.referral!.adId ? <span>Ad ID: {message.referral!.adId}</span> : null}
+            {message.referral!.ref ? <span>Ref: {message.referral!.ref}</span> : null}
+          </div>
+          <ReferralAdLinks referral={message.referral!} pageId={pageId} />
+        </div>
+      ) : null}
+      <MessageMediaGallery
+        imageUrls={message.imageUrls}
+        videoUrls={message.videoUrls}
+        audioUrls={message.audioUrls}
+      />
+      {message.imageUrl ? (
+        <img className="bubble-image" src={message.imageUrl} alt="" loading="lazy" referrerPolicy="no-referrer" />
+      ) : null}
+      {hasText ? <p>{message.text}</p> : null}
+      {!hasAny ? (
+        <p className="bubble-empty-hint">
+          Tin này không có nội dung hiển thị được (ví dụ chỉ sticker hoặc loại file chưa hỗ trợ).
+        </p>
+      ) : null}
+    </article>
+  )
+})
+
 function mapInboxMessageAuthor(author: FacebookStoreMessage['author']): Message['author'] {
   if (author === 'ai' || author === 'system') return 'ai'
   if (author === 'staff' || author === 'page') return 'staff'
@@ -730,10 +889,74 @@ function Avatar({ conversation, large = false }: { conversation: Conversation; l
 }
 
 function PageAvatar({ page }: { page: Page }) {
+  const [imgFailed, setImgFailed] = useState(false)
+  const avatarSrc = page.avatarUrl && !imgFailed ? metaHostedMediaSrc(page.avatarUrl) : null
+
+  useEffect(() => {
+    setImgFailed(false)
+  }, [page.id, page.avatarUrl])
+
   return (
     <span className="page-icon">
-      {page.avatarUrl ? <img src={page.avatarUrl} alt={page.name} /> : page.name.slice(0, 1)}
+      {avatarSrc ? (
+        <img
+          src={avatarSrc}
+          alt={page.name}
+          onError={() => setImgFailed(true)}
+          referrerPolicy="no-referrer"
+        />
+      ) : (
+        page.name.slice(0, 1)
+      )}
     </span>
+  )
+}
+
+const SALON_TU_KA_WA_MAIN_PAGE_ID = '101860728184920'
+
+function normalizePageBrandName(name: string): string {
+  return name
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '')
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, ' ')
+}
+
+/** Fanpage chính "Salon Tú Ka Wa" (không phải CN con như "Salon Tú Ka Wa - Thủ Đức"). */
+function pickSalonTuKaWaBrandPage(pages: Page[]): Page | undefined {
+  const byId = pages.find((p) => p.id === SALON_TU_KA_WA_MAIN_PAGE_ID)
+  if (byId?.avatarUrl) return byId
+  return pages.find((p) => {
+    const n = normalizePageBrandName(p.name)
+    return n === 'salon tu ka wa' || (n.startsWith('salon tu ka wa') && !n.includes(' - '))
+  })
+}
+
+function BrandMark({ page }: { page?: Page }) {
+  const [imgFailed, setImgFailed] = useState(false)
+  const avatarSrc = page?.avatarUrl && !imgFailed ? metaHostedMediaSrc(page.avatarUrl) : null
+
+  useEffect(() => {
+    setImgFailed(false)
+  }, [page?.id, page?.avatarUrl])
+
+  return (
+    <div
+      className={avatarSrc ? 'brand-mark brand-mark--image' : 'brand-mark'}
+      aria-hidden={avatarSrc ? true : undefined}
+    >
+      {avatarSrc ? (
+        <img
+          src={avatarSrc}
+          alt="Salon Tú Ka Wa"
+          referrerPolicy="no-referrer"
+          onError={() => setImgFailed(true)}
+        />
+      ) : (
+        'TKW'
+      )}
+    </div>
   )
 }
 
@@ -803,23 +1026,59 @@ async function patchFacebookPageApi(
   return body.page ?? null
 }
 
-async function fetchFacebookInboxData(): Promise<{ pages: Page[]; conversations: Conversation[] }> {
-  const res = await fetch('/api/facebook/conversations', { cache: 'no-store' })
+type InboxConvClocks = Record<string, string>
+
+async function fetchFacebookInboxData(
+  since?: string,
+  focusConversationId?: string,
+  clocks?: InboxConvClocks,
+): Promise<{
+  pages: Page[]
+  conversations: Conversation[]
+  updatedAt?: string
+  unchanged?: boolean
+  partial?: boolean
+  fullSync?: boolean
+  removedConversationIds?: string[]
+  convClocks?: InboxConvClocks
+}> {
+  const usePoll =
+    Boolean(since) && clocks !== undefined && Object.keys(clocks).length > 0
+  const res = await fetch(
+    usePoll ? '/api/facebook/conversations/poll' : '/api/facebook/conversations',
+    {
+      method: usePoll ? 'POST' : 'GET',
+      cache: 'no-store',
+      headers: usePoll ? { 'Content-Type': 'application/json' } : undefined,
+      body: usePoll
+        ? JSON.stringify({ since, focus: focusConversationId, clocks })
+        : undefined,
+    },
+  )
   if (res.status === 404) return { pages: [], conversations: [] }
   if (!res.ok) throw new Error(`Không tải được hội thoại Facebook (${res.status}).`)
   const body = (await res.json()) as {
+    unchanged?: boolean
+    partial?: boolean
+    fullSync?: boolean
+    updatedAt?: string
     pages?: FacebookStorePage[]
     conversations?: FacebookStoreConversation[]
+    convClocks?: InboxConvClocks
+    removedConversationIds?: string[]
   }
-  const conversations = (body.conversations ?? []).map(mapStoredConversation)
-  const unreadByPage = new Map<string, number>()
-  for (const conversation of conversations) {
-    if (conversation.status === 'new') {
-      unreadByPage.set(conversation.pageId, (unreadByPage.get(conversation.pageId) ?? 0) + 1)
+  if (body.unchanged) {
+    return { pages: [], conversations: [], unchanged: true, updatedAt: body.updatedAt }
+  }
+
+  const mapPages = (pages: FacebookStorePage[], convsForUnread: Conversation[]): Page[] => {
+    const unreadByPage = new Map<string, number>()
+    for (const conversation of convsForUnread) {
+      if (conversation.status === 'new') {
+        unreadByPage.set(conversation.pageId, (unreadByPage.get(conversation.pageId) ?? 0) + 1)
+      }
     }
-  }
-  return {
-    pages: (body.pages ?? []).map((page) => ({
+    return pages.map((page) => ({
       id: page.id,
       name: page.name,
       avatarUrl: page.avatarUrl,
@@ -827,8 +1086,28 @@ async function fetchFacebookInboxData(): Promise<{ pages: Page[]; conversations:
       connected: page.connected,
       defaultBranchPageId: page.defaultBranchPageId,
       aiMasterEnabled: page.aiMasterEnabled,
-    })),
+    }))
+  }
+
+  const conversations = (body.conversations ?? []).map(mapStoredConversation)
+
+  if (body.partial) {
+    return {
+      pages: mapPages(body.pages ?? [], conversations),
+      conversations,
+      updatedAt: body.updatedAt,
+      partial: true,
+      removedConversationIds: body.removedConversationIds ?? [],
+      convClocks: body.convClocks,
+    }
+  }
+
+  return {
+    pages: mapPages(body.pages ?? [], conversations),
     conversations,
+    updatedAt: body.updatedAt,
+    fullSync: body.fullSync ?? true,
+    convClocks: body.convClocks,
   }
 }
 async function triggerFacebookSync() {
@@ -856,18 +1135,30 @@ function App() {
   const [pendingImage, setPendingImage] = useState<{ dataUrl: string; name: string } | null>(null)
   const composerFileRef = useRef<HTMLInputElement>(null)
   const messageFeedRef = useRef<HTMLDivElement>(null)
+  const inboxStickToBottomRef = useRef(true)
+  const inboxPrependAdjustRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null)
+  const inboxLoadingMoreRef = useRef(false)
+  const [inboxVisibleMessageCount, setInboxVisibleMessageCount] = useState(INBOX_MESSAGE_PAGE_SIZE)
+  const [conversationVisibleCount, setConversationVisibleCount] = useState(CONVERSATION_PAGE_SIZE)
   const [syncState, setSyncState] = useState<SyncState>('idle')
   const [syncMessage, setSyncMessage] = useState('Đang kiểm tra kết nối fanpage...')
   const [facebookStatus, setFacebookStatus] = useState<FacebookStatus | null>(null)
   const [facebookConversationError, setFacebookConversationError] = useState<string | null>(null)
   const [facebookSendBusy, setFacebookSendBusy] = useState(false)
   const [pageSettingsPageId, setPageSettingsPageId] = useState<string | null>(null)
-  const [pageModalBranch, setPageModalBranch] = useState('')
   const [pageModalMasterAi, setPageModalMasterAi] = useState(true)
   const [isMobileInbox, setIsMobileInbox] = useState(() =>
     typeof window !== 'undefined' ? window.matchMedia('(max-width: 940px)').matches : false,
   )
   const [mobileInboxPane, setMobileInboxPane] = useState<'pages' | 'conversations' | 'chat'>('pages')
+  const inboxPollInFlightRef = useRef(false)
+  const inboxStoreUpdatedAtRef = useRef('')
+  const inboxConvClocksRef = useRef<InboxConvClocks>({})
+  const selectedConversationIdRef = useRef(selectedConversationId)
+  const selectedConversationRef = useRef<Conversation | undefined>(undefined)
+  const inboxVisibleMessageCountRef = useRef(inboxVisibleMessageCount)
+  selectedConversationIdRef.current = selectedConversationId
+  inboxVisibleMessageCountRef.current = inboxVisibleMessageCount
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
@@ -925,14 +1216,71 @@ function App() {
   }, [])
 
   useEffect(() => {
+    if (activeTab !== 'inbox') return
+
     let alive = true
+    let timer = 0
+
+    const pollMs = () =>
+      typeof document !== 'undefined' && document.visibilityState === 'hidden'
+        ? INBOX_POLL_MS_HIDDEN
+        : INBOX_POLL_MS_VISIBLE
+
+    const scheduleNext = () => {
+      window.clearTimeout(timer)
+      timer = window.setTimeout(() => {
+        void load()
+      }, pollMs())
+    }
 
     const load = async () => {
+      if (inboxPollInFlightRef.current) {
+        scheduleNext()
+        return
+      }
+      inboxPollInFlightRef.current = true
       try {
-        const inboxData = await fetchFacebookInboxData()
+        const clocks = inboxConvClocksRef.current
+        const inboxData = await fetchFacebookInboxData(
+          inboxStoreUpdatedAtRef.current || undefined,
+          selectedConversationIdRef.current || undefined,
+          Object.keys(clocks).length > 0 ? clocks : undefined,
+        )
         if (!alive) return
-        setPages(inboxData.pages)
-        setConversations(inboxData.conversations)
+        if (inboxData.unchanged) return
+        if (inboxData.updatedAt) inboxStoreUpdatedAtRef.current = inboxData.updatedAt
+        if (inboxData.convClocks) inboxConvClocksRef.current = inboxData.convClocks
+        setPages((prev) => {
+          const nextPages = inboxData.pages.map((page) => ({
+            ...page,
+            unread: prev.find((p) => p.id === page.id)?.unread ?? page.unread,
+          }))
+          if (
+            prev.length === nextPages.length &&
+            prev.every(
+              (p, i) =>
+                p.id === nextPages[i]?.id &&
+                p.name === nextPages[i]?.name &&
+                p.unread === nextPages[i]?.unread &&
+                p.connected === nextPages[i]?.connected &&
+                p.aiMasterEnabled === nextPages[i]?.aiMasterEnabled,
+            )
+          ) {
+            return prev
+          }
+          return nextPages
+        })
+        const selectedId = selectedConversationIdRef.current
+        setConversations((prev) =>
+          inboxData.partial
+            ? mergePartialInboxConversations(
+                prev,
+                inboxData.conversations,
+                inboxData.removedConversationIds ?? [],
+                selectedId,
+              )
+            : mergeInboxConversations(prev, inboxData.conversations, selectedId),
+        )
         setSelectedPageId((current) => {
           if (!inboxData.pages.length) return ''
           if (current === ALL_FANPAGES_ID) return ALL_FANPAGES_ID
@@ -948,19 +1296,35 @@ function App() {
       } catch (e) {
         if (!alive) return
         setFacebookConversationError(e instanceof Error ? e.message : String(e))
+      } finally {
+        inboxPollInFlightRef.current = false
+        if (alive) scheduleNext()
       }
     }
 
+    const onVisibility = () => {
+      if (!alive) return
+      scheduleNext()
+    }
+
     void load()
-    const timer = window.setInterval(() => void load(), 4_000)
+    document.addEventListener('visibilitychange', onVisibility)
     return () => {
       alive = false
-      window.clearInterval(timer)
+      window.clearTimeout(timer)
+      document.removeEventListener('visibilitychange', onVisibility)
     }
-  }, [])
+  }, [activeTab])
 
   useEffect(() => {
     setPendingImage(null)
+  }, [selectedConversationId])
+
+  useEffect(() => {
+    inboxStickToBottomRef.current = true
+    inboxPrependAdjustRef.current = null
+    inboxLoadingMoreRef.current = false
+    setInboxVisibleMessageCount(INBOX_MESSAGE_PAGE_SIZE)
   }, [selectedConversationId])
 
   useEffect(() => {
@@ -968,9 +1332,14 @@ function App() {
     const p = pages.find((x) => x.id === pageSettingsPageId)
     if (!p) {
       setPageSettingsPageId(null)
-      return
     }
-    setPageModalBranch(p.defaultBranchPageId != null ? String(p.defaultBranchPageId) : '')
+  }, [pageSettingsPageId, pages])
+
+  /** Chỉ nạp form khi mở modal — cấm reset mỗi lần poll inbox (4s). */
+  useEffect(() => {
+    if (!pageSettingsPageId) return
+    const p = pages.find((x) => x.id === pageSettingsPageId)
+    if (!p) return
     setPageModalMasterAi(p.aiMasterEnabled !== false)
   }, [pageSettingsPageId, pages])
 
@@ -990,8 +1359,25 @@ function App() {
     return conversations.filter((item) => item.pageId === selectedPageId)
   }, [conversations, selectedPageId])
 
+  useEffect(() => {
+    setConversationVisibleCount(CONVERSATION_PAGE_SIZE)
+  }, [selectedPageId])
+
+  const visibleConversations = useMemo(() => {
+    if (filteredConversations.length <= conversationVisibleCount) return filteredConversations
+    const selectedInFiltered = filteredConversations.find((item) => item.id === selectedConversationId)
+    const head = filteredConversations.slice(0, conversationVisibleCount)
+    if (selectedInFiltered && !head.some((item) => item.id === selectedInFiltered.id)) {
+      return [...head, selectedInFiltered]
+    }
+    return head
+  }, [filteredConversations, conversationVisibleCount, selectedConversationId])
+
+  const hiddenConversationCount = Math.max(0, filteredConversations.length - conversationVisibleCount)
+
   const selectedConversation =
     filteredConversations.find((item) => item.id === selectedConversationId) ?? filteredConversations[0]
+  selectedConversationRef.current = selectedConversation
 
   useEffect(() => {
     if (!selectedPageId) return
@@ -1018,10 +1404,74 @@ function App() {
   useLayoutEffect(() => {
     const el = messageFeedRef.current
     if (!el || !inboxMessagesScrollKey) return
+    if (!inboxStickToBottomRef.current) return
     el.scrollTop = el.scrollHeight
   }, [inboxMessagesScrollKey])
 
+  const inboxVisibleMessages = useMemo(() => {
+    const msgs = selectedConversation?.messages ?? []
+    const start = Math.max(0, msgs.length - inboxVisibleMessageCount)
+    return msgs.slice(start)
+  }, [selectedConversation, inboxVisibleMessageCount])
+
+  useLayoutEffect(() => {
+    const el = messageFeedRef.current
+    const adjust = inboxPrependAdjustRef.current
+    if (!el || !adjust) return
+    const delta = el.scrollHeight - adjust.scrollHeight
+    el.scrollTop = adjust.scrollTop + delta
+    inboxPrependAdjustRef.current = null
+    inboxLoadingMoreRef.current = false
+  }, [inboxVisibleMessageCount, selectedConversationId])
+
+  useEffect(() => {
+    const el = messageFeedRef.current
+    if (!el) return
+
+    let raf = 0
+    let scrollEndTimer = 0
+
+    const onScroll = () => {
+      el.classList.add('is-scrolling')
+      window.clearTimeout(scrollEndTimer)
+      scrollEndTimer = window.setTimeout(() => el.classList.remove('is-scrolling'), 140)
+
+      if (raf) return
+      raf = window.requestAnimationFrame(() => {
+        raf = 0
+        const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+        inboxStickToBottomRef.current = distanceFromBottom < INBOX_MESSAGE_STICKY_BOTTOM_PX
+
+        const conv = selectedConversationRef.current
+        if (!conv) return
+        if (el.scrollTop > INBOX_MESSAGE_LOAD_THRESHOLD_PX) return
+        if (inboxLoadingMoreRef.current) return
+        const total = conv.messages.length
+        if (inboxVisibleMessageCountRef.current >= total) return
+        inboxLoadingMoreRef.current = true
+        inboxPrependAdjustRef.current = { scrollHeight: el.scrollHeight, scrollTop: el.scrollTop }
+        setInboxVisibleMessageCount((current) => Math.min(total, current + INBOX_MESSAGE_PAGE_SIZE))
+      })
+    }
+
+    el.addEventListener('scroll', onScroll, { passive: true })
+    return () => {
+      el.removeEventListener('scroll', onScroll)
+      window.clearTimeout(scrollEndTimer)
+      if (raf) window.cancelAnimationFrame(raf)
+      el.classList.remove('is-scrolling')
+    }
+  }, [selectedConversationId])
+
   const selectedPage = pages.find((page) => page.id === selectedConversation?.pageId)
+
+  const pageSettingsInferredBranch = useMemo(() => {
+    if (!pageSettingsPageId) return null
+    const p = pages.find((x) => x.id === pageSettingsPageId)
+    if (!p) return null
+    const idx = pages.findIndex((x) => x.id === pageSettingsPageId)
+    return inferBranchForFacebookPage(p, idx >= 0 ? idx : 0)
+  }, [pageSettingsPageId, pages])
 
   const pageSettingsTotalUsd = useMemo(() => {
     if (!pageSettingsPageId) return 0
@@ -1034,6 +1484,11 @@ function App() {
   const totalUnread = pages.reduce((sum, page) => sum + page.unread, 0)
   const aiActive = conversations.filter((item) => item.aiEnabled).length
   const needsHuman = conversations.filter((item) => item.status === 'human').length
+  const totalAiCostUsd = useMemo(
+    () => conversations.reduce((sum, c) => sum + (c.aiEstimatedTotalUsd ?? 0), 0),
+    [conversations],
+  )
+  const salonBrandPage = useMemo(() => pickSalonTuKaWaBrandPage(pages), [pages])
 
   const updateConversation = (id: string, updater: (conversation: Conversation) => Conversation) => {
     setConversations((items) => items.map((item) => (item.id === id ? updater(item) : item)))
@@ -1057,8 +1512,14 @@ function App() {
           })),
         )
       }
+      inboxStoreUpdatedAtRef.current = ''
+      inboxConvClocksRef.current = {}
       const inboxData = await fetchFacebookInboxData()
-      setConversations(inboxData.conversations)
+      if (inboxData.updatedAt) inboxStoreUpdatedAtRef.current = inboxData.updatedAt
+      if (inboxData.convClocks) inboxConvClocksRef.current = inboxData.convClocks
+      setConversations((prev) =>
+        mergeInboxConversations(prev, inboxData.conversations, selectedConversationIdRef.current),
+      )
       setPages((prev) =>
         inboxData.pages.map((page) => ({
           ...page,
@@ -1100,9 +1561,7 @@ function App() {
     if (!pageSettingsPageId) return
     void (async () => {
       try {
-        const branchVal = pageModalBranch === '' ? null : Number(pageModalBranch)
         const savedPage = await patchFacebookPageApi(pageSettingsPageId, {
-          defaultBranchPageId: branchVal,
           aiMasterEnabled: pageModalMasterAi,
         })
         setPages((prev) =>
@@ -1152,9 +1611,15 @@ function App() {
         }
         setDraft('')
         setPendingImage(null)
+        inboxStoreUpdatedAtRef.current = ''
+        inboxConvClocksRef.current = {}
         const inboxData = await fetchFacebookInboxData()
+        if (inboxData.updatedAt) inboxStoreUpdatedAtRef.current = inboxData.updatedAt
+        if (inboxData.convClocks) inboxConvClocksRef.current = inboxData.convClocks
         setPages(inboxData.pages)
-        setConversations(inboxData.conversations)
+        setConversations((prev) =>
+          mergeInboxConversations(prev, inboxData.conversations, selectedConversation.id),
+        )
       } finally {
         setFacebookSendBusy(false)
       }
@@ -1210,7 +1675,7 @@ function App() {
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-mark">TKW</div>
+          <BrandMark page={salonBrandPage} />
           <div>
             <h1>Salon Tú Ka Wa</h1>
             <p>Fanpage inbox + training AI</p>
@@ -1218,10 +1683,32 @@ function App() {
         </div>
         <button
           type="button"
-          className="ghost-button theme-toggle"
+          className="theme-toggle"
+          aria-label={theme === 'dark' ? 'Chuyển sang giao diện sáng' : 'Chuyển sang giao diện tối'}
+          title={theme === 'dark' ? 'Light mode' : 'Dark mode'}
           onClick={() => setTheme((v) => (v === 'dark' ? 'light' : 'dark'))}
         >
-          {theme === 'dark' ? 'Light mode' : 'Dark mode'}
+          {theme === 'dark' ? (
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden>
+              <circle cx="12" cy="12" r="4" stroke="currentColor" strokeWidth="1.8" />
+              <path
+                d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+              />
+            </svg>
+          ) : (
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden>
+              <path
+                d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5a.7.7 0 0 0-.92-.86 9.5 9.5 0 1 0 12.48 12.48.7.7 0 0 0-.86-.92Z"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinejoin="round"
+              />
+            </svg>
+          )}
+          <span>{theme === 'dark' ? 'Light mode' : 'Dark mode'}</span>
         </button>
 
         <nav className="inbox-tabs" aria-label="Khu vực làm việc">
@@ -1254,6 +1741,10 @@ function App() {
             <span>Cần nhân viên</span>
             <strong>{needsHuman}</strong>
           </div>
+          <div className="metric">
+            <span>Tổng chi AI</span>
+            <strong>{formatInboxAiCostVnd(totalAiCostUsd)}</strong>
+          </div>
         </div>
 
         <div className="sync-card">
@@ -1265,24 +1756,26 @@ function App() {
         </div>
       </aside>
 
-      <main className="workspace">
+      <main className={activeTab === 'inbox' && isMobileInbox ? 'workspace workspace-inbox-mobile' : 'workspace'}>
         <section
           className="workspace-section workspace-section-inbox"
           aria-hidden={activeTab !== 'inbox'}
           style={{ display: activeTab === 'inbox' ? undefined : 'none' }}
         >
           <div className="inbox-section-shell">
-            <section className="topbar">
-              <div>
-                <p className="eyebrow">Developer: Nguyễn Việt Sơn</p>
-                <p className="topbar-contact">Contact: 0978478240</p>
-              </div>
-              <div className="topbar-actions">
-                <button type="button" className="ghost-button" onClick={() => void handleSync()}>
-                  {syncState === 'syncing' ? 'Đang đồng bộ...' : 'Đồng bộ Facebook'}
-                </button>
-              </div>
-            </section>
+            {!(isMobileInbox && mobileInboxPane !== 'pages') && (
+              <section className="topbar">
+                <div>
+                  <p className="eyebrow">Developer: Nguyễn Việt Sơn</p>
+                  <p className="topbar-contact">Contact: 0978478240</p>
+                </div>
+                <div className="topbar-actions">
+                  <button type="button" className="ghost-button" onClick={() => void handleSync()}>
+                    {syncState === 'syncing' ? 'Đang đồng bộ...' : 'Đồng bộ Facebook'}
+                  </button>
+                </div>
+              </section>
+            )}
 
             {facebookConversationError && <div className="notice error">{facebookConversationError}</div>}
 
@@ -1400,7 +1893,7 @@ function App() {
                     <span>Nhắn thử vào fanpage — tin mới sẽ hiện ở đây.</span>
                   </div>
                 )}
-                {filteredConversations.map((conversation) => (
+                {visibleConversations.map((conversation) => (
                   <button
                     type="button"
                     key={conversation.id}
@@ -1438,6 +1931,20 @@ function App() {
                     </span>
                   </button>
                 ))}
+                {hiddenConversationCount > 0 && (
+                  <button
+                    type="button"
+                    className="conversation-load-more"
+                    onClick={() =>
+                      setConversationVisibleCount((current) =>
+                        Math.min(filteredConversations.length, current + CONVERSATION_PAGE_SIZE),
+                      )
+                    }
+                  >
+                    Xem thêm <b>{Math.min(CONVERSATION_PAGE_SIZE, hiddenConversationCount)}</b>
+                    <small>còn {hiddenConversationCount} hội thoại</small>
+                  </button>
+                )}
               </div>
               </div>
 
@@ -1544,79 +2051,14 @@ function App() {
                         </small>
                       </div>
                     </div>
-                    {selectedConversation.messages.map((message) => {
-                      const referralBlock =
-                        Boolean(message.referral) &&
-                        Boolean(
-                          message.referral!.adId ||
-                            message.referral!.title ||
-                            message.referral!.photoUrl ||
-                            message.referral!.videoUrl ||
-                            message.referral!.ref ||
-                            message.referral!.source,
-                        )
-                      const hasGallery =
-                        (message.imageUrls?.length ?? 0) > 0 ||
-                        (message.videoUrls?.length ?? 0) > 0 ||
-                        (message.audioUrls?.length ?? 0) > 0
-                      const hasStaffImg = Boolean(message.imageUrl)
-                      const hasText =
-                        Boolean(message.text.trim()) && !isPlaceholderInboxText(message.text)
-                      const hasAny = referralBlock || hasGallery || hasStaffImg || hasText
-
-                      return (
-                      <article key={message.id} className={`bubble ${message.author}`}>
-                        <span className="bubble-meta">
-                          {(() => {
-                            const meta = inboxAuthorMeta(message.author, selectedConversation.customer)
-                            return (
-                              <>
-                                <span className={`author-badge author-badge-${message.author}`}>
-                                  {meta.badge}
-                                </span>
-                                <span className="author-label">{meta.label}</span>
-                                <span className="bubble-time">{message.time}</span>
-                              </>
-                            )
-                          })()}
-                        </span>
-                        {referralBlock ? (
-                          <div className="bubble-ad-card">
-                            {message.referral!.title ? (
-                              <strong className="bubble-ad-title">{message.referral!.title}</strong>
-                            ) : null}
-                            <AdCreativeMedia referral={message.referral!} pageId={selectedConversation.pageId} />
-                            <div className="bubble-ad-meta">
-                              {message.referral!.source ? <span>{message.referral!.source}</span> : null}
-                              {message.referral!.type ? <span>{message.referral!.type}</span> : null}
-                              {message.referral!.adId ? <span>Ad ID: {message.referral!.adId}</span> : null}
-                              {message.referral!.ref ? <span>Ref: {message.referral!.ref}</span> : null}
-                            </div>
-                            <ReferralAdLinks referral={message.referral!} pageId={selectedConversation.pageId} />
-                          </div>
-                        ) : null}
-                        <MessageMediaGallery
-                          imageUrls={message.imageUrls}
-                          videoUrls={message.videoUrls}
-                          audioUrls={message.audioUrls}
-                        />
-                        {message.imageUrl ? (
-                          <img
-                            className="bubble-image"
-                            src={message.imageUrl}
-                            alt=""
-                            referrerPolicy="no-referrer"
-                          />
-                        ) : null}
-                        {hasText ? <p>{message.text}</p> : null}
-                        {!hasAny ? (
-                          <p className="bubble-empty-hint">
-                            Tin này không có nội dung hiển thị được (ví dụ chỉ sticker hoặc loại file chưa hỗ trợ).
-                          </p>
-                        ) : null}
-                      </article>
-                      )
-                    })}
+                    {inboxVisibleMessages.map((message) => (
+                      <InboxMessageBubble
+                        key={message.id}
+                        message={message}
+                        customerName={selectedConversation.customer}
+                        pageId={selectedConversation.pageId}
+                      />
+                    ))}
                   </div>
 
                   <footer className="inbox-composer">
@@ -1698,22 +2140,14 @@ function App() {
                   <h2 id="page-settings-title">
                     Cài đặt · {pages.find((p) => p.id === pageSettingsPageId)?.name ?? 'Fanpage'}
                   </h2>
-                  <label className="page-settings-label" htmlFor="page-modal-branch">
-                    Ngữ cảnh chi nhánh (mặc định cho fanpage)
-                  </label>
-                  <select
-                    id="page-modal-branch"
-                    className="chat-branch-select"
-                    value={pageModalBranch}
-                    onChange={(e) => setPageModalBranch(e.target.value)}
-                  >
-                    <option value="">Tự động (theo tên fanpage)</option>
-                    {BRANCH_PAGES.map((b) => (
-                      <option key={b.id} value={String(b.id)}>
-                        {b.name} - {b.address}
-                      </option>
-                    ))}
-                  </select>
+                  {pageSettingsInferredBranch ? (
+                    <p className="page-settings-branch-auto">
+                      <strong>Chi nhánh AI (theo tên fanpage):</strong>{' '}
+                      {pageSettingsInferredBranch.name}
+                      <br />
+                      <small>{pageSettingsInferredBranch.address}</small>
+                    </p>
+                  ) : null}
                   <label className="page-settings-toggle-row">
                     <span>
                       <strong>AI tự trả lời toàn fanpage</strong>

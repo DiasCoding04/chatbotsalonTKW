@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { writeMaybeCompressed } from "./compression.js";
 import { contextEditTokenRequired, verifyContextEditToken } from "./context-auth.js";
 import { resolveGeminiContextCacheTtlSeconds } from "./context-cache-ttl.js";
 import { ensureSharedContextCache, purgeAllSharedContextCachesRemote, } from "./context-cache-store.js";
@@ -11,7 +12,7 @@ import { applySecurityHeaders } from "./security-headers.js";
 import { canServeStaticBuild, tryServeStatic } from "./static.js";
 import { tryProxyUpstream } from "./upstream-proxy.js";
 import { useVertexGeminiBackend } from "./vertex-auth.js";
-import { handleFacebookApi, startFacebookAiUnrepliedSweep } from "./facebook.js";
+import { handleFacebookApi, startFacebookMessagingBootstrap } from "./facebook.js";
 loadEnvFile();
 assertProductionEnv();
 const PORT = Number(process.env.PORT) ||
@@ -21,11 +22,16 @@ const HOST = process.env.CONTEXT_CACHE_SERVER_HOST?.trim() || '0.0.0.0';
 const DEFAULT_MODEL = process.env.VITE_GEMINI_MODEL?.trim() || 'gemini-3.1-flash-lite';
 const PUBLIC_URL = process.env.APP_PUBLIC_URL?.trim() || '';
 const MAX_CONTEXT_CHARS = Number(process.env.CONTEXT_MAX_CHARS) || 500_000;
-function sendJson(res, status, body) {
-    applySecurityHeaders(res);
-    res.statusCode = status;
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    res.end(JSON.stringify(body));
+const MAX_ENSURE_SYSTEM_PROMPT_CHARS = Number(process.env.GEMINI_ENSURE_SYSTEM_PROMPT_MAX_CHARS) > 0
+    ? Math.floor(Number(process.env.GEMINI_ENSURE_SYSTEM_PROMPT_MAX_CHARS))
+    : Math.min(950_000, Math.max(MAX_CONTEXT_CHARS * 2, MAX_CONTEXT_CHARS));
+function makeSendJson(req) {
+    return (res, status, body) => {
+        applySecurityHeaders(res);
+        res.statusCode = status;
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        writeMaybeCompressed(req, res, JSON.stringify(body));
+    };
 }
 function contextApiPayload(doc) {
     return {
@@ -35,6 +41,7 @@ function contextApiPayload(doc) {
     };
 }
 const server = createServer((req, res) => {
+    const sendJson = makeSendJson(req);
     void (async () => {
         const requestUrl = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
         const url = requestUrl.pathname;
@@ -101,6 +108,12 @@ const server = createServer((req, res) => {
                 sendJson(res, 400, { error: 'Thiếu systemPrompt.' });
                 return;
             }
+            if (systemPrompt.length > MAX_ENSURE_SYSTEM_PROMPT_CHARS) {
+                sendJson(res, 413, {
+                    error: `systemPrompt quá dài (${systemPrompt.length} ký tự). Tối đa ${MAX_ENSURE_SYSTEM_PROMPT_CHARS}.`,
+                });
+                return;
+            }
             const model = body.model?.trim() || DEFAULT_MODEL;
             const rawTtl = body.ttlSeconds;
             const n = typeof rawTtl === 'number' ? rawTtl : Number(rawTtl);
@@ -113,7 +126,9 @@ const server = createServer((req, res) => {
             }
             catch (e) {
                 const msg = e instanceof Error ? e.message : String(e);
-                sendJson(res, 502, { error: msg });
+                const isTimeout = /timed out|timeout|AbortError|abort/i.test(msg);
+                console.warn('[context-cache ensure]', isTimeout ? 'timeout' : 'error', msg.slice(0, 500));
+                sendJson(res, isTimeout ? 504 : 502, { error: msg.slice(0, 2000) });
             }
             return;
         }
@@ -144,7 +159,18 @@ const server = createServer((req, res) => {
         sendJson(res, 404, { error: 'Not found' });
     })().catch((e) => {
         const msg = e instanceof Error ? e.message : String(e);
-        sendJson(res, 500, { error: msg });
+        try {
+            sendJson(res, 500, { error: msg });
+        }
+        catch {
+            try {
+                res.statusCode = 500;
+                res.end();
+            }
+            catch {
+                /* ignore */
+            }
+        }
     });
 });
 function scheduleRemoteContextCachePurgeOnShutdown() {
@@ -172,10 +198,12 @@ void ensureContextFile().then(() => {
         if (canServeStaticBuild())
             modes.push('static');
         const publicLabel = PUBLIC_URL ? ` · ${PUBLIC_URL}` : '';
+        const ctxBackend = process.env.CONTEXT_BACKEND?.trim() || (process.env.K_SERVICE ? 'firestore' : 'file');
         console.log(`[context-cache] http://${HOST}:${PORT} (${modes.join(' + ')})${publicLabel}`);
+        console.log(`[context] backend=${ctxBackend} idleKillMin=${Math.round((Number(process.env.GEMINI_CONTEXT_CACHE_IDLE_MS) || 1_800_000) / 60_000)}`);
         if (!contextEditTokenRequired()) {
             console.warn('[context-cache] CONTEXT_EDITOR_TOKEN chưa đặt — ai cũng có thể PUT /api/context. Đặt token trước khi mở domain.');
         }
-        startFacebookAiUnrepliedSweep();
+        startFacebookMessagingBootstrap();
     });
 });

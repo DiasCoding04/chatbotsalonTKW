@@ -64,8 +64,8 @@ export function ContextEditor({
           <div>
             <h2 id="context-editor-title">Sửa CONTEXT.md trên server</h2>
             <p className="context-editor-sub">
-              Lưu vào data/CONTEXT.md (nguồn chính) và mirror public/CONTEXT.md. Inbox AI Messenger đọc cùng
-              file qua server.
+              Lưu vào Firestore (một CONTEXT duy nhất cho Training + Inbox). Mirror public/CONTEXT.md để
+              deploy seed.
             </p>
           </div>
           <button type="button" className="secondary" onClick={onClose} disabled={saving}>
