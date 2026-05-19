@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { contextFirestoreDocName, contextFirestoreDocUrl, fetchFirestoreWithAuth, firestoreCommitUrl, resolveFirestoreProjectId, } from "./firestore-rest.js";
+const MAX_SHARED_CONTEXT_CACHE_RECORDS = 32;
 function parseSharedCache(fields) {
     const name = fields?.contextCacheName?.stringValue?.trim();
     const fingerprint = fields?.contextCacheFingerprint?.stringValue?.trim();
@@ -12,6 +13,43 @@ function parseSharedCache(fields) {
         return null;
     return { name, fingerprint, expireAtMs };
 }
+function parseSharedCaches(fields) {
+    const raw = fields?.contextCachesJson?.stringValue?.trim();
+    const records = [];
+    if (raw) {
+        try {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+                for (const item of parsed) {
+                    if (!item || typeof item !== 'object')
+                        continue;
+                    const candidate = item;
+                    if (typeof candidate.name !== 'string' ||
+                        typeof candidate.fingerprint !== 'string' ||
+                        typeof candidate.expireAtMs !== 'number' ||
+                        !Number.isFinite(candidate.expireAtMs)) {
+                        continue;
+                    }
+                    const name = candidate.name.trim();
+                    const fingerprint = candidate.fingerprint.trim();
+                    if (!name || !fingerprint)
+                        continue;
+                    records.push({ name, fingerprint, expireAtMs: candidate.expireAtMs });
+                }
+            }
+        }
+        catch {
+            /* Legacy documents simply won't have the JSON registry yet. */
+        }
+    }
+    const legacy = parseSharedCache(fields);
+    if (legacy && !records.some((record) => record.fingerprint === legacy.fingerprint)) {
+        records.push(legacy);
+    }
+    return records
+        .sort((a, b) => b.expireAtMs - a.expireAtMs)
+        .slice(0, MAX_SHARED_CONTEXT_CACHE_RECORDS);
+}
 function parseFirestoreDoc(raw, status) {
     if (status === 404)
         return null;
@@ -21,13 +59,15 @@ function parseFirestoreDoc(raw, status) {
     const content = doc.fields?.content?.stringValue ?? '';
     const updatedAt = doc.fields?.updatedAt?.stringValue?.trim() || new Date().toISOString();
     const activity = doc.fields?.contextCacheLastActivityAt?.stringValue?.trim() || null;
+    const sharedContextCaches = parseSharedCaches(doc.fields);
     const lockUntilRaw = doc.fields?.contextCacheLockUntil?.stringValue?.trim();
     const lockUntilMs = lockUntilRaw ? Date.parse(lockUntilRaw) : NaN;
     return {
         content,
         updatedAt,
         contextCacheLastActivityAt: activity,
-        sharedContextCache: parseSharedCache(doc.fields),
+        sharedContextCache: sharedContextCaches[0] ?? null,
+        sharedContextCaches,
         contextCacheLockOwner: doc.fields?.contextCacheLockOwner?.stringValue?.trim() || null,
         contextCacheLockUntilMs: Number.isFinite(lockUntilMs) ? lockUntilMs : null,
         updateTime: doc.updateTime?.trim() || null,
@@ -86,6 +126,7 @@ export async function writeContextToFirestore(content, updatedAt) {
         updatedAt,
         contextCacheLastActivityAt: existing?.contextCacheLastActivityAt ?? null,
         sharedContextCache: null,
+        sharedContextCaches: [],
         contextCacheLockOwner: null,
         contextCacheLockUntilMs: null,
         updateTime: null,
@@ -97,6 +138,16 @@ export async function readFirestoreContextDoc() {
 export async function writeSharedContextCacheToFirestore(record) {
     if (!resolveFirestoreProjectId())
         return;
+    const existing = await readContextFromFirestore();
+    const now = Date.now();
+    const merged = [
+        record,
+        ...(existing?.sharedContextCaches ?? []).filter((item) => item.fingerprint !== record.fingerprint &&
+            item.expireAtMs > now &&
+            item.name.trim().length > 0),
+    ]
+        .sort((a, b) => b.expireAtMs - a.expireAtMs)
+        .slice(0, MAX_SHARED_CONTEXT_CACHE_RECORDS);
     const res = await fetchFirestoreWithAuth(firestoreCommitUrl(), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -109,6 +160,7 @@ export async function writeSharedContextCacheToFirestore(record) {
                             contextCacheName: { stringValue: record.name },
                             contextCacheFingerprint: { stringValue: record.fingerprint },
                             contextCacheExpireAt: { stringValue: new Date(record.expireAtMs).toISOString() },
+                            contextCachesJson: { stringValue: JSON.stringify(merged) },
                             contextCacheLockOwner: { nullValue: null },
                             contextCacheLockUntil: { nullValue: null },
                         },
@@ -118,6 +170,7 @@ export async function writeSharedContextCacheToFirestore(record) {
                             'contextCacheName',
                             'contextCacheFingerprint',
                             'contextCacheExpireAt',
+                            'contextCachesJson',
                             'contextCacheLockOwner',
                             'contextCacheLockUntil',
                         ],
@@ -129,6 +182,50 @@ export async function writeSharedContextCacheToFirestore(record) {
     const raw = await res.text();
     if (!res.ok)
         throw new Error(raw || `Firestore shared cache write failed (${res.status})`);
+}
+export async function deleteSharedContextCacheFromFirestore(fingerprint) {
+    if (!resolveFirestoreProjectId())
+        return;
+    const existing = await readContextFromFirestore();
+    if (!existing)
+        return;
+    const next = existing.sharedContextCaches.filter((record) => record.fingerprint !== fingerprint);
+    const latest = next[0] ?? null;
+    const res = await fetchFirestoreWithAuth(firestoreCommitUrl(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            writes: [
+                {
+                    update: {
+                        name: contextFirestoreDocName(),
+                        fields: {
+                            contextCacheName: latest ? { stringValue: latest.name } : { nullValue: null },
+                            contextCacheFingerprint: latest
+                                ? { stringValue: latest.fingerprint }
+                                : { nullValue: null },
+                            contextCacheExpireAt: latest
+                                ? { stringValue: new Date(latest.expireAtMs).toISOString() }
+                                : { nullValue: null },
+                            contextCachesJson: { stringValue: JSON.stringify(next) },
+                        },
+                    },
+                    updateMask: {
+                        fieldPaths: [
+                            'contextCacheName',
+                            'contextCacheFingerprint',
+                            'contextCacheExpireAt',
+                            'contextCachesJson',
+                        ],
+                    },
+                },
+            ],
+        }),
+    });
+    const raw = await res.text();
+    if (!res.ok && res.status !== 404) {
+        console.warn('[context-firestore] deleteSharedContextCache failed:', raw.slice(0, 300));
+    }
 }
 export async function clearSharedContextCacheInFirestore() {
     if (!resolveFirestoreProjectId())
@@ -145,6 +242,7 @@ export async function clearSharedContextCacheInFirestore() {
                             contextCacheName: { nullValue: null },
                             contextCacheFingerprint: { nullValue: null },
                             contextCacheExpireAt: { nullValue: null },
+                            contextCachesJson: { nullValue: null },
                             contextCacheLockOwner: { nullValue: null },
                             contextCacheLockUntil: { nullValue: null },
                         },
@@ -154,6 +252,7 @@ export async function clearSharedContextCacheInFirestore() {
                             'contextCacheName',
                             'contextCacheFingerprint',
                             'contextCacheExpireAt',
+                            'contextCachesJson',
                             'contextCacheLockOwner',
                             'contextCacheLockUntil',
                         ],
@@ -277,14 +376,21 @@ export async function touchContextCacheActivityInFirestore(now = Date.now()) {
 export async function clearContextCacheActivityInFirestore() {
     if (!resolveFirestoreProjectId())
         return;
-    const res = await fetchFirestoreWithAuth(contextFirestoreDocUrl(), {
-        method: 'PATCH',
+    const res = await fetchFirestoreWithAuth(firestoreCommitUrl(), {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-            fields: {
-                contextCacheLastActivityAt: { nullValue: null },
-            },
-            updateMask: { fieldPaths: ['contextCacheLastActivityAt'] },
+            writes: [
+                {
+                    update: {
+                        name: contextFirestoreDocName(),
+                        fields: {
+                            contextCacheLastActivityAt: { nullValue: null },
+                        },
+                    },
+                    updateMask: { fieldPaths: ['contextCacheLastActivityAt'] },
+                },
+            ],
         }),
     });
     if (!res.ok && res.status !== 404) {

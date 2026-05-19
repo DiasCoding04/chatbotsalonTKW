@@ -15,6 +15,38 @@ function upstreamTimingEnabled() {
 function msSince(start) {
     return Number(process.hrtime.bigint() - start) / 1_000_000;
 }
+const UPSTREAM_ERROR_BODY_LOG_LIMIT_BYTES = 16 * 1024;
+const UPSTREAM_ERROR_BODY_RESPONSE_LIMIT_BYTES = 256 * 1024;
+function bufferPreview(buf, maxChars = 700) {
+    const raw = buf.toString('utf8');
+    return raw.length > maxChars ? `${raw.slice(0, maxChars)}…` : raw;
+}
+function collectStreamWithLimit(stream, maxBytes) {
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        let total = 0;
+        let truncated = false;
+        stream.on('data', (chunk) => {
+            const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            if (truncated)
+                return;
+            const next = total + buf.length;
+            if (next <= maxBytes) {
+                chunks.push(buf);
+                total = next;
+                return;
+            }
+            const rest = maxBytes - total;
+            if (rest > 0) {
+                chunks.push(buf.subarray(0, rest));
+                total = maxBytes;
+            }
+            truncated = true;
+        });
+        stream.on('end', () => resolve({ body: Buffer.concat(chunks, total), truncated }));
+        stream.on('error', reject);
+    });
+}
 function vertexLocation() {
     return process.env.VERTEX_AI_LOCATION?.trim() || 'global';
 }
@@ -94,16 +126,41 @@ export function tryProxyUpstream(req, res) {
             path: `${upstreamPath}${upstreamSearch}`,
             headers,
         }, (proxyRes) => {
+            const statusCode = proxyRes.statusCode ?? 502;
             if (logTiming) {
-                console.log(`[upstream] ${req.method ?? 'GET'} ${upstreamPath} status=${proxyRes.statusCode ?? 0} headers=${msSince(startedAt).toFixed(0)}ms`);
+                console.log(`[upstream] ${req.method ?? 'GET'} ${upstreamPath} status=${statusCode} headers=${msSince(startedAt).toFixed(0)}ms`);
             }
-            res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
-            proxyRes.on('end', () => {
-                if (logTiming) {
-                    console.log(`[upstream] ${req.method ?? 'GET'} ${upstreamPath} done=${msSince(startedAt).toFixed(0)}ms`);
+            const isErrorStatus = statusCode >= 400;
+            if (!isErrorStatus) {
+                res.writeHead(statusCode, proxyRes.headers);
+                proxyRes.on('end', () => {
+                    if (logTiming) {
+                        console.log(`[upstream] ${req.method ?? 'GET'} ${upstreamPath} done=${msSince(startedAt).toFixed(0)}ms`);
+                    }
+                });
+                proxyRes.pipe(res);
+                return;
+            }
+            void collectStreamWithLimit(proxyRes, UPSTREAM_ERROR_BODY_RESPONSE_LIMIT_BYTES)
+                .then(({ body, truncated }) => {
+                const reqId = String(proxyRes.headers['x-request-id'] ?? '') ||
+                    String(proxyRes.headers['x-goog-request-id'] ?? '') ||
+                    String(proxyRes.headers['x-cloud-trace-context'] ?? '');
+                const preview = bufferPreview(body.subarray(0, Math.min(body.length, UPSTREAM_ERROR_BODY_LOG_LIMIT_BYTES)));
+                console.error(`[upstream] ${req.method ?? 'GET'} ${upstreamPath} failed status=${statusCode} done=${msSince(startedAt).toFixed(0)}ms reqId=${reqId || '-'} truncated=${truncated} body=${preview}`);
+                if (!res.headersSent) {
+                    res.writeHead(statusCode, proxyRes.headers);
                 }
+                res.end(body);
+            })
+                .catch((e) => {
+                const msg = e instanceof Error ? e.message : String(e);
+                console.error(`[upstream] ${req.method ?? 'GET'} ${upstreamPath} failed status=${statusCode} body_read_error=${msg}`);
+                if (!res.headersSent) {
+                    res.statusCode = statusCode;
+                }
+                res.end();
             });
-            proxyRes.pipe(res);
         });
         proxyReq.on('error', (e) => {
             const msg = e instanceof Error ? e.message : String(e);

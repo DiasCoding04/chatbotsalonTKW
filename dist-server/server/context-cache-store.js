@@ -1,8 +1,9 @@
 import { buildContextCacheFingerprint } from "../shared/context-cache-key.js";
 import { estimateContextCacheTokens, GEMINI_CONTEXT_CACHE_MIN_TOKENS, isContextCacheEligible, } from "../shared/context-cache-eligibility.js";
-import { clearContextCacheActivityInFirestore, clearSharedContextCacheInFirestore, readContextCacheLastActivityMs, readContextFromFirestore, releaseContextCacheCreateLock, tryAcquireContextCacheCreateLock, touchContextCacheActivityInFirestore, useFirestoreContextBackend, writeSharedContextCacheToFirestore, } from "./context-firestore.js";
+import { clearContextCacheActivityInFirestore, clearSharedContextCacheInFirestore, deleteSharedContextCacheFromFirestore, readContextCacheLastActivityMs, readContextFromFirestore, releaseContextCacheCreateLock, tryAcquireContextCacheCreateLock, touchContextCacheActivityInFirestore, useFirestoreContextBackend, writeSharedContextCacheToFirestore, } from "./context-firestore.js";
 import { ContextCacheIneligibleError, createCachedContentWithRetry, deleteCachedContent, listAllCachedContentNames, } from "./gemini-cache.js";
 const DEFAULT_CACHE_IDLE_MS = 30 * 60 * 1000;
+const DEFAULT_ACTIVITY_TOUCH_INTERVAL_MS = 5 * 60 * 1000;
 export function resolveContextCacheIdleMs() {
     const raw = process.env.GEMINI_CONTEXT_CACHE_IDLE_MS?.trim();
     if (raw) {
@@ -12,11 +13,25 @@ export function resolveContextCacheIdleMs() {
     }
     return DEFAULT_CACHE_IDLE_MS;
 }
-/** Tin AI mới — gia hạn idle window (Firestore, dùng chung mọi instance). */
+function resolveContextCacheActivityTouchIntervalMs() {
+    const raw = process.env.GEMINI_CONTEXT_CACHE_ACTIVITY_TOUCH_INTERVAL_MS?.trim();
+    if (raw) {
+        const n = Number(raw);
+        if (Number.isFinite(n) && n >= 1_000)
+            return Math.floor(n);
+    }
+    return DEFAULT_ACTIVITY_TOUCH_INTERVAL_MS;
+}
+let lastActivityTouchAt = 0;
+/** Tin AI mới — gia hạn idle window, nhưng không ghi Firestore cho từng request. */
 export async function touchContextCacheActivity() {
     if (!useFirestoreContextBackend())
         return;
-    await touchContextCacheActivityInFirestore();
+    const now = Date.now();
+    if (now - lastActivityTouchAt < resolveContextCacheActivityTouchIntervalMs())
+        return;
+    await touchContextCacheActivityInFirestore(now);
+    lastActivityTouchAt = now;
 }
 const EXPIRE_BUFFER_MS = 30_000;
 const entries = new Map();
@@ -32,7 +47,7 @@ async function finishCachedResult(result) {
     }
     return result;
 }
-/** Xóa mọi cachedContent trên Vertex trừ bản canonical (luôn 1 cache). */
+/** File backend cũ: giữ tối đa 1 cache remote để tránh rác local-dev. */
 async function enforceRemoteSingletonKeepOnly(apiKey, keepName) {
     const keep = keepName.trim();
     if (!keep)
@@ -60,12 +75,11 @@ async function enforceRemoteSingletonKeepOnly(apiKey, keepName) {
 }
 async function adoptFirestoreSharedCache(apiKey, fingerprint, estimatedTokens) {
     const doc = await readContextFromFirestore();
-    const shared = doc?.sharedContextCache;
-    if (!shared || shared.fingerprint !== fingerprint)
+    const shared = doc?.sharedContextCaches.find((record) => record.fingerprint === fingerprint);
+    if (!shared)
         return null;
     if (shared.expireAtMs <= Date.now() + EXPIRE_BUFFER_MS_FIRESTORE)
         return null;
-    await enforceRemoteSingletonKeepOnly(apiKey, shared.name);
     entries.set(fingerprint, {
         fingerprint,
         name: shared.name,
@@ -98,6 +112,10 @@ export async function evictSharedContextCacheAndDeleteRemote(apiKey, model, syst
     entries.delete(fingerprint);
     if (entry) {
         await deleteCachedContent(apiKey, entry.name);
+    }
+    if (useFirestoreContextBackend()) {
+        await deleteSharedContextCacheFromFirestore(fingerprint);
+        return;
     }
     await reconcileSingletonRemoteContextCache(apiKey, fingerprint);
 }
@@ -203,6 +221,7 @@ export async function purgeAllSharedContextCachesRemote(apiKey) {
     }
     entries.clear();
     lastReconcileAt = Date.now();
+    lastActivityTouchAt = 0;
     await clearContextCacheActivityInFirestore().catch(() => undefined);
     await clearSharedContextCacheInFirestore().catch(() => undefined);
     return n;
@@ -230,7 +249,7 @@ export async function ensureSharedContextCache(apiKey, model, systemPrompt, ttlS
     }
     const existing = entries.get(fingerprint);
     if (existing && isValid(existing, fingerprint, now)) {
-        if (now - lastReconcileAt < RECONCILE_MIN_INTERVAL_MS) {
+        if (useFirestoreContextBackend() || now - lastReconcileAt < RECONCILE_MIN_INTERVAL_MS) {
             return finishCachedResult({
                 mode: 'cached',
                 name: existing.name,
@@ -256,8 +275,9 @@ export async function ensureSharedContextCache(apiKey, model, systemPrompt, ttlS
             .then(async () => {
             const again = entries.get(fingerprint);
             if (again && isValid(again, fingerprint, now)) {
-                if (now - lastReconcileAt < RECONCILE_MIN_INTERVAL_MS)
+                if (useFirestoreContextBackend() || now - lastReconcileAt < RECONCILE_MIN_INTERVAL_MS) {
                     return again;
+                }
                 const deleted = await reconcileSingletonRemoteContextCache(apiKey, fingerprint);
                 if (deleted === 0)
                     return again;
@@ -281,11 +301,6 @@ export async function ensureSharedContextCache(apiKey, model, systemPrompt, ttlS
                     const again = await adoptFirestoreSharedCache(apiKey, fingerprint, estimatedTokens);
                     if (again)
                         return entries.get(fingerprint) ?? null;
-                    await enforceRemoteSingletonKeepOnly(apiKey, ''); // xóa hết trước khi tạo mới
-                    const remoteBefore = await listAllCachedContentNames(apiKey);
-                    for (const stale of remoteBefore) {
-                        await deleteCachedContent(apiKey, stale);
-                    }
                     const info = await createCachedContentWithRetry(apiKey, model, systemPrompt, ttlSeconds);
                     let expireAt = now + ttlSeconds * 1000;
                     if (info.expireTime) {
@@ -300,8 +315,7 @@ export async function ensureSharedContextCache(apiKey, model, systemPrompt, ttlS
                     });
                     const entry = { fingerprint, name: info.name, expireAt };
                     entries.set(fingerprint, entry);
-                    await enforceRemoteSingletonKeepOnly(apiKey, info.name);
-                    console.log('[context-cache] singleton: created 1 cache (registry)', info.name.slice(-24));
+                    console.log('[context-cache] registry: created cache', `fp=${fingerprint}`, info.name.slice(-24));
                     return entry;
                 }
                 finally {

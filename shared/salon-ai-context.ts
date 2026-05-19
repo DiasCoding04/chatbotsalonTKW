@@ -40,7 +40,7 @@ export const BRANCH_PAGES: BranchPage[] = [
   { id: 17, name: 'CN 17 - TÚ KA WA TÂY NINH', address: '953 Cách Mạng Tháng 8, TP Tây Ninh', hotline: '0393734330' },
   { id: 18, name: 'CN 18 - Vũng Tàu', address: '496 Trương Công Định, Phường Vũng Tàu, TP.HCM', hotline: '0348648396' },
   { id: 19, name: 'CN 19 - Nha Trang', address: '150 Nguyễn Thị Minh Khai, Phường Nha Trang, Khánh Hòa', hotline: '0898888564' },
-  { id: 20, name: 'CN 20 - An Giang', address: '125 Trần Quang Khải, Phường Rạch Giá, An Giang', hotline: '0336536076' },
+  { id: 20, name: 'CN 20 - Rạch Giá', address: '125 Trần Quang Khải, Phường Rạch Giá, An Giang', hotline: '0336536076' },
 ]
 
 export function buildFanpagePrompt(branch: BranchPage): string {
@@ -680,6 +680,7 @@ const CUSTOMER_SERVICE_INTENT_RE = [
   /\bmai phap\b/,
   /\bmai ngang\b/,
   /\bphu bac\b/,
+  /\bphu bac\s/,  // Match "phu bac" ngay cả khi có từ sau (không cần word boundary cuối)
   /\bhighlight\b/,
   /\bphuc hoi\b/,
   /\bphong chan\b/,

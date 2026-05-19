@@ -206,8 +206,70 @@ const INBOX_MESSAGE_PAGE_SIZE = 30
 const CONVERSATION_PAGE_SIZE = 30
 const INBOX_MESSAGE_LOAD_THRESHOLD_PX = 90
 const INBOX_MESSAGE_STICKY_BOTTOM_PX = 140
-const INBOX_POLL_MS_VISIBLE = 15_000
-const INBOX_POLL_MS_HIDDEN = 60_000
+const INBOX_POLL_MS_VISIBLE = 25_000
+const INBOX_POLL_MS_HIDDEN = 90_000
+const FACEBOOK_STATUS_POLL_MS = 5 * 60_000
+const INBOX_CACHE_STORAGE_KEY = 'salon-facebook-inbox-cache-v1'
+const INBOX_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000
+
+type InboxPersistedCache = {
+  savedAt: number
+  pages: Page[]
+  conversations: Conversation[]
+  updatedAt: string
+  convClocks: Record<string, string>
+}
+
+function readInboxPersistedCache(): InboxPersistedCache | null {
+  try {
+    const raw = localStorage.getItem(INBOX_CACHE_STORAGE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as Partial<InboxPersistedCache>
+    if (
+      !Number.isFinite(parsed.savedAt) ||
+      Date.now() - Number(parsed.savedAt) > INBOX_CACHE_MAX_AGE_MS ||
+      !Array.isArray(parsed.pages) ||
+      !Array.isArray(parsed.conversations) ||
+      typeof parsed.updatedAt !== 'string' ||
+      !parsed.convClocks ||
+      typeof parsed.convClocks !== 'object'
+    ) {
+      return null
+    }
+    return {
+      savedAt: Number(parsed.savedAt),
+      pages: parsed.pages as Page[],
+      conversations: parsed.conversations as Conversation[],
+      updatedAt: parsed.updatedAt,
+      convClocks: parsed.convClocks as Record<string, string>,
+    }
+  } catch {
+    return null
+  }
+}
+
+function writeInboxPersistedCache(cache: Omit<InboxPersistedCache, 'savedAt'>): void {
+  try {
+    if (!cache.updatedAt || !cache.pages.length || !cache.conversations.length) return
+    localStorage.setItem(
+      INBOX_CACHE_STORAGE_KEY,
+      JSON.stringify({
+        ...cache,
+        savedAt: Date.now(),
+      } satisfies InboxPersistedCache),
+    )
+  } catch {
+    // Best effort only; cache should never block inbox usage.
+  }
+}
+
+function clearInboxPersistedCache(): void {
+  try {
+    localStorage.removeItem(INBOX_CACHE_STORAGE_KEY)
+  } catch {
+    // ignore
+  }
+}
 
 function conversationPollFingerprint(c: Conversation): string {
   const msgs = c.messages
@@ -535,6 +597,53 @@ function metaHostedMediaSrc(original: string): string {
   return original
 }
 
+type AdCreativeFreshMedia = { imageUrl?: string; videoUrl?: string }
+const adCreativeClientCache = new Map<
+  string,
+  { value: AdCreativeFreshMedia | null; expireAt: number }
+>()
+const adCreativeClientInflight = new Map<string, Promise<AdCreativeFreshMedia | null>>()
+const AD_CREATIVE_CLIENT_CACHE_TTL_MS = 6 * 60 * 60 * 1000
+const AD_CREATIVE_CLIENT_FALLBACK_TTL_MS = 15 * 60 * 1000
+
+async function fetchAdCreativeMediaCached(
+  pageId: string,
+  postId: string,
+): Promise<AdCreativeFreshMedia | null> {
+  const key = `${pageId}:${postId}`
+  const now = Date.now()
+  const cached = adCreativeClientCache.get(key)
+  if (cached && cached.expireAt > now) return cached.value
+
+  let pending = adCreativeClientInflight.get(key)
+  if (!pending) {
+    pending = fetch(
+      `/api/facebook/ad-creative?pageId=${encodeURIComponent(pageId)}&postId=${encodeURIComponent(postId)}`,
+      { cache: 'no-store' },
+    )
+      .then((r) => r.json())
+      .then((d: { ok?: boolean; imageUrl?: string; videoUrl?: string }) => {
+        if (!d?.ok || (!d.imageUrl && !d.videoUrl)) return null
+        return { imageUrl: d.imageUrl, videoUrl: d.videoUrl }
+      })
+      .catch(() => null)
+      .then((value) => {
+        adCreativeClientCache.set(key, {
+          value,
+          expireAt:
+            Date.now() +
+            (value ? AD_CREATIVE_CLIENT_CACHE_TTL_MS : AD_CREATIVE_CLIENT_FALLBACK_TTL_MS),
+        })
+        return value
+      })
+      .finally(() => {
+        adCreativeClientInflight.delete(key)
+      })
+    adCreativeClientInflight.set(key, pending)
+  }
+  return pending
+}
+
 function AdCreativeMedia({ referral, pageId }: { referral: MessageReferral; pageId: string }) {
   const [fresh, setFresh] = useState<{ imageUrl?: string; videoUrl?: string } | null>(null)
   const [mediaFailed, setMediaFailed] = useState(false)
@@ -545,16 +654,11 @@ function AdCreativeMedia({ referral, pageId }: { referral: MessageReferral; page
     const postId = referral.postId?.trim()
     if (!postId || !pageId.trim()) return
     let cancelled = false
-    void fetch(
-      `/api/facebook/ad-creative?pageId=${encodeURIComponent(pageId)}&postId=${encodeURIComponent(postId)}`,
-      { cache: 'no-store' },
-    )
-      .then((r) => r.json())
-      .then((d: { ok?: boolean; imageUrl?: string; videoUrl?: string }) => {
-        if (cancelled || !d?.ok) return
-        if (d.imageUrl || d.videoUrl) setFresh({ imageUrl: d.imageUrl, videoUrl: d.videoUrl })
+    void fetchAdCreativeMediaCached(pageId, postId)
+      .then((d) => {
+        if (cancelled || !d) return
+        if (d.imageUrl || d.videoUrl) setFresh(d)
       })
-      .catch(() => {})
     return () => {
       cancelled = true
     }
@@ -1122,15 +1226,26 @@ async function triggerFacebookSync() {
 }
 
 function App() {
+  const initialInboxCacheRef = useRef<InboxPersistedCache | null | undefined>(undefined)
+  if (initialInboxCacheRef.current === undefined) {
+    initialInboxCacheRef.current = readInboxPersistedCache()
+  }
+  const initialInboxCache = initialInboxCacheRef.current
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     const current = document.documentElement.getAttribute('data-theme')
     return current === 'dark' ? 'dark' : 'light'
   })
   const [activeTab, setActiveTab] = useState<TabKey>('inbox')
-  const [pages, setPages] = useState<Page[]>([])
-  const [selectedPageId, setSelectedPageId] = useState('')
-  const [conversations, setConversations] = useState<Conversation[]>([])
-  const [selectedConversationId, setSelectedConversationId] = useState('')
+  const [pages, setPages] = useState<Page[]>(() => initialInboxCache?.pages ?? [])
+  const [selectedPageId, setSelectedPageId] = useState(
+    () => initialInboxCache?.pages[0]?.id ?? '',
+  )
+  const [conversations, setConversations] = useState<Conversation[]>(
+    () => initialInboxCache?.conversations ?? [],
+  )
+  const [selectedConversationId, setSelectedConversationId] = useState(
+    () => initialInboxCache?.conversations[0]?.id ?? '',
+  )
   const [draft, setDraft] = useState('')
   const [pendingImage, setPendingImage] = useState<{ dataUrl: string; name: string } | null>(null)
   const composerFileRef = useRef<HTMLInputElement>(null)
@@ -1152,8 +1267,8 @@ function App() {
   )
   const [mobileInboxPane, setMobileInboxPane] = useState<'pages' | 'conversations' | 'chat'>('pages')
   const inboxPollInFlightRef = useRef(false)
-  const inboxStoreUpdatedAtRef = useRef('')
-  const inboxConvClocksRef = useRef<InboxConvClocks>({})
+  const inboxStoreUpdatedAtRef = useRef(initialInboxCache?.updatedAt ?? '')
+  const inboxConvClocksRef = useRef<InboxConvClocks>(initialInboxCache?.convClocks ?? {})
   const selectedConversationIdRef = useRef(selectedConversationId)
   const selectedConversationRef = useRef<Conversation | undefined>(undefined)
   const inboxVisibleMessageCountRef = useRef(inboxVisibleMessageCount)
@@ -1168,6 +1283,15 @@ function App() {
       // ignore
     }
   }, [theme])
+
+  useEffect(() => {
+    writeInboxPersistedCache({
+      pages,
+      conversations,
+      updatedAt: inboxStoreUpdatedAtRef.current,
+      convClocks: inboxConvClocksRef.current,
+    })
+  }, [pages, conversations])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -1208,7 +1332,7 @@ function App() {
     }
 
     void load()
-    const timer = window.setInterval(() => void load(), 30_000)
+    const timer = window.setInterval(() => void load(), FACEBOOK_STATUS_POLL_MS)
     return () => {
       alive = false
       window.clearInterval(timer)
@@ -1514,6 +1638,7 @@ function App() {
       }
       inboxStoreUpdatedAtRef.current = ''
       inboxConvClocksRef.current = {}
+      clearInboxPersistedCache()
       const inboxData = await fetchFacebookInboxData()
       if (inboxData.updatedAt) inboxStoreUpdatedAtRef.current = inboxData.updatedAt
       if (inboxData.convClocks) inboxConvClocksRef.current = inboxData.convClocks
@@ -1613,6 +1738,7 @@ function App() {
         setPendingImage(null)
         inboxStoreUpdatedAtRef.current = ''
         inboxConvClocksRef.current = {}
+        clearInboxPersistedCache()
         const inboxData = await fetchFacebookInboxData()
         if (inboxData.updatedAt) inboxStoreUpdatedAtRef.current = inboxData.updatedAt
         if (inboxData.convClocks) inboxConvClocksRef.current = inboxData.convClocks

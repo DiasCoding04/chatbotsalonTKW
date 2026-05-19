@@ -7,7 +7,7 @@ import { estimateContextCacheTokens } from '../shared/context-cache-eligibility.
 import { resolveGeminiContextCacheTtlSeconds } from './context-cache-ttl.ts'
 import {
   ensureSharedContextCache,
-  purgeAllSharedContextCachesRemote,
+  evictSharedContextCacheAndDeleteRemote,
   touchContextCacheActivity,
 } from './context-cache-store.ts'
 import { readContextDocument, readImageSamplesDocument } from './context-store.ts'
@@ -332,7 +332,11 @@ async function generateGeminiTextWithSystemPrompt(
 }
 
 /** AI đọc lại tối đa N tin gần nhất (text + ảnh pixel cho mọi tin khách có ảnh trong cửa sổ). */
-const FACEBOOK_AI_HISTORY_MAX_MESSAGES = 20
+function resolveFacebookAiHistoryMaxMessages(): number {
+  const raw = Number(process.env.FACEBOOK_AI_HISTORY_MAX_MESSAGES)
+  if (Number.isFinite(raw) && raw >= 4) return Math.min(30, Math.floor(raw))
+  return 12
+}
 
 const MAX_IMAGE_BYTES_FOR_GEMINI = 4 * 1024 * 1024
 const MAX_AUDIO_BYTES_FOR_GEMINI = 8 * 1024 * 1024
@@ -512,13 +516,27 @@ export type FacebookAiDeps = {
 
 const replyChain = new Map<string, Promise<void>>()
 
-/** Chờ khách ngừng nhắn (mặc định 20s) rồi mới đọc lại tối đa 20 tin gần nhất và trả lời. */
+function logFacebookAiTiming(
+  conversationId: string,
+  stage: string,
+  startedAt: number,
+  extra?: Record<string, string | number | boolean | undefined>,
+): void {
+  const parts = Object.entries(extra ?? {})
+    .filter(([, value]) => value !== undefined)
+    .map(([key, value]) => `${key}=${String(value)}`)
+  console.log(
+    `[facebook-ai-timing] conversation=${conversationId} stage=${stage} elapsedMs=${Date.now() - startedAt}${parts.length ? ` ${parts.join(' ')}` : ''}`,
+  )
+}
+
+/** Chờ khách ngừng nhắn rồi mới đọc lại các tin gần nhất và trả lời. */
 export function resolveFacebookAiReplyDebounceMs(): number {
   const raw = process.env.FACEBOOK_AI_REPLY_DEBOUNCE_MS?.trim()
   if (raw === '0') return 0
   const n = Number(raw)
   if (Number.isFinite(n) && n >= 0) return n
-  return 20_000
+  return 12_000
 }
 
 const pendingReplyDebouncers = new Map<
@@ -531,11 +549,13 @@ const pendingReplyDebouncers = new Map<
 >()
 
 const aiReplyRetryAttempt = new Map<string, number>()
+const fallbackSentAtByConversation = new Map<string, number>()
+const FALLBACK_MIN_INTERVAL_MS = 5 * 60 * 1000
 
 function resolveAiReplyMaxRetries(): number {
   const n = Number(process.env.FACEBOOK_AI_REPLY_MAX_RETRIES)
   if (Number.isFinite(n) && n >= 0) return Math.min(8, Math.floor(n))
-  return 5
+  return 2
 }
 
 function resolveAiReplyRetryDelayMs(attempt: number): number {
@@ -546,6 +566,57 @@ function resolveAiReplyRetryDelayMs(attempt: number): number {
 
 function clearAiReplyRetry(conversationId: string): void {
   aiReplyRetryAttempt.delete(conversationId)
+}
+
+const FACEBOOK_AI_RETRY_EXHAUSTED_FALLBACK =
+  'Dạ em xin lỗi chị, hệ thống đang chậm một chút. Em đã nhận tin và sẽ phản hồi chị ngay khi ổn định ạ.'
+
+async function sendFallbackWhenRetryExhausted(
+  target: { conversationId: string; pageId: string; customerPsid: string },
+  deps: FacebookAiDeps,
+): Promise<void> {
+  const now = Date.now()
+  const prev = fallbackSentAtByConversation.get(target.conversationId) ?? 0
+  if (now - prev < FALLBACK_MIN_INTERVAL_MS) return
+  try {
+    const token = await deps.getPageToken(target.pageId)
+    if (!token) return
+    const r = await deps.graphSendText(token, target.customerPsid, FACEBOOK_AI_RETRY_EXHAUSTED_FALLBACK)
+    if (r.error?.message || !r.message_id) return
+    registerAiOutboundMessageId(r.message_id)
+    await appendOutboundFacebookMessage({
+      pageId: target.pageId,
+      customerPsid: target.customerPsid,
+      message: {
+        id: r.message_id,
+        author: 'ai',
+        text: FACEBOOK_AI_RETRY_EXHAUSTED_FALLBACK,
+        timestamp: new Date().toISOString(),
+      },
+    })
+    fallbackSentAtByConversation.set(target.conversationId, now)
+  } catch {
+    // best-effort fallback
+  }
+}
+
+function isRetriableAiError(reason: string, err?: unknown): boolean {
+  const r = reason.toLowerCase()
+  if (r.includes('claim_busy_or_race')) return true
+  const msg = (err instanceof Error ? err.message : String(err ?? '')).toLowerCase()
+  if (!msg) return true
+  if (
+    msg.includes('invalid_argument') ||
+    msg.includes('unknown name') ||
+    msg.includes('cannot find field') ||
+    msg.includes('at least one contents field is required') ||
+    msg.includes('permission_denied') ||
+    msg.includes('unauthenticated') ||
+    msg.includes('api key not valid')
+  ) {
+    return false
+  }
+  return true
 }
 
 /** Thử lại khi Gemini/Graph lỗi tạm hoặc claim bị giữ — không quét Firestore định kỳ. */
@@ -560,6 +631,7 @@ function scheduleAiReplyRetry(
   if (attempt >= max) {
     console.warn('[facebook-ai]', target.conversationId, 'hết lượt thử lại:', reason)
     aiReplyRetryAttempt.delete(target.conversationId)
+    void sendFallbackWhenRetryExhausted(target, deps)
     return
   }
   aiReplyRetryAttempt.set(target.conversationId, attempt + 1)
@@ -696,8 +768,10 @@ async function executeFacebookAiReply(
   target: { conversationId: string; pageId: string; customerPsid: string },
   deps: FacebookAiDeps,
 ): Promise<void> {
+  const startedAt = Date.now()
   let claimedCustomerMessageId: string | undefined
   try {
+    logFacebookAiTiming(target.conversationId, 'start', startedAt)
     const loaded = await readFacebookStoreForConversation(target.conversationId, target.pageId)
     if (!loaded) return
     const { conv, page } = loaded
@@ -709,8 +783,12 @@ async function executeFacebookAiReply(
     if (!lastCustomer) return
 
     const customerMessageId = lastCustomer.id
-    const claimed = await tryClaimFacebookAiReply(target.conversationId, customerMessageId)
-    if (!claimed) {
+    const claim = await tryClaimFacebookAiReply(target.conversationId, customerMessageId)
+    logFacebookAiTiming(target.conversationId, 'claim_result', startedAt, {
+      ok: claim.ok,
+      reason: claim.reason,
+    })
+    if (!claim.ok) {
       console.log(
         '[facebook-ai]',
         target.conversationId,
@@ -751,7 +829,7 @@ async function executeFacebookAiReply(
     const ttl = resolveGeminiContextCacheTtlSeconds()
     const model = resolveGeminiModelId()
 
-    const msgSlice = selectAiHistoryMessages(conv.messages, FACEBOOK_AI_HISTORY_MAX_MESSAGES)
+    const msgSlice = selectAiHistoryMessages(conv.messages, resolveFacebookAiHistoryMaxMessages())
     const partialHistory = storedMessagesToPartialTurns({ messages: msgSlice })
     if (!partialHistory.length || partialHistory[partialHistory.length - 1]?.role !== 'user') {
       if (claimedCustomerMessageId) {
@@ -774,7 +852,15 @@ async function executeFacebookAiReply(
     let lastErr: unknown
     for (let attempt = 0; attempt < 4; attempt++) {
       const cache = await ensureSharedContextCache(apiKey, model, systemPrompt, ttl)
+      logFacebookAiTiming(target.conversationId, 'cache_ready', startedAt, {
+        attempt: attempt + 1,
+        mode: cache.mode,
+        reused: cache.reused,
+      })
       try {
+        logFacebookAiTiming(target.conversationId, 'model_start', startedAt, {
+          attempt: attempt + 1,
+        })
         const gen =
           cache.mode === 'inline'
             ? await generateGeminiTextWithSystemPrompt(model, systemPrompt, history, maxOut)
@@ -782,12 +868,18 @@ async function executeFacebookAiReply(
         raw = gen.text
         lastGenUsage = gen.usageMetadata
         lastErr = undefined
+        logFacebookAiTiming(target.conversationId, 'model_done', startedAt, {
+          attempt: attempt + 1,
+          promptTokens: gen.usageMetadata?.promptTokenCount,
+          cachedTokens: gen.usageMetadata?.cachedContentTokenCount,
+          outputTokens: gen.usageMetadata?.candidatesTokenCount,
+        })
         break
       } catch (e) {
         lastErr = e
         const msg = e instanceof Error ? e.message : String(e)
         if (attempt < 3 && looksLikeStaleContextCacheError(msg)) {
-          await purgeAllSharedContextCachesRemote(apiKey)
+          await evictSharedContextCacheAndDeleteRemote(apiKey, model, systemPrompt)
           await new Promise((r) => setTimeout(r, 250 * (attempt + 1)))
           continue
         }
@@ -942,6 +1034,10 @@ async function executeFacebookAiReply(
         await markFacebookAiReplyCompleted(target.conversationId, claimedCustomerMessageId)
         clearAiReplyRetry(target.conversationId)
       }
+      logFacebookAiTiming(target.conversationId, 'delivered', startedAt, {
+        messages: deliveredCount,
+        cacheHit: contextCacheHit,
+      })
     } else {
       console.warn('[facebook-ai]', target.conversationId, 'Không gửi được tin nào — không cộng chi phí inbox.')
       if (claimedCustomerMessageId) {
@@ -950,13 +1046,21 @@ async function executeFacebookAiReply(
       scheduleAiReplyRetry(target, deps, 'no_delivery')
     }
   } catch (e) {
+    logFacebookAiTiming(target.conversationId, 'error', startedAt, {
+      message: e instanceof Error ? e.message.slice(0, 120) : String(e).slice(0, 120),
+    })
     console.warn('[facebook-ai]', target.conversationId, e)
     if (claimedCustomerMessageId) {
       await releaseFacebookAiReplyClaim(target.conversationId, claimedCustomerMessageId).catch(
         () => undefined,
       )
     }
-    scheduleAiReplyRetry(target, deps, 'execute_error')
+    if (isRetriableAiError('execute_error', e)) {
+      scheduleAiReplyRetry(target, deps, 'execute_error')
+    } else {
+      console.warn('[facebook-ai]', target.conversationId, 'Bỏ retry vì lỗi không thể hồi phục.')
+      clearAiReplyRetry(target.conversationId)
+    }
   }
 }
 

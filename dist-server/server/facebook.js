@@ -11,11 +11,19 @@ import { loadFacebookTokenVault } from "./facebook-token-vault.js";
 import { appendOutboundFacebookMessage, enrichFacebookConversationProfiles, ingestFacebookWebhookPayload, listFacebookConversations, patchFacebookConversation, patchFacebookPage, readFacebookStoreSnapshot, saveFacebookPages, } from "./facebook-store.js";
 const pageTokenCache = new Map();
 const customerProfileCache = new Map();
+const customerProfileNegativeCache = new Map();
+const adCreativeMediaCache = new Map();
+const AD_CREATIVE_MEDIA_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const AD_CREATIVE_MEDIA_FALLBACK_TTL_MS = 15 * 60 * 1000;
+const CUSTOMER_PROFILE_NEGATIVE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 let profileEnrichInFlight = false;
-/** Tránh gọi enrich Graph mỗi lần poll inbox (4s) — gây lag server + UI. */
+/** Enrich profile là best-effort; chạy hiếm để tránh quét store + gọi Graph lặp vô ích. */
 let lastInboxPollProfileEnrichAt = 0;
-const INBOX_POLL_PROFILE_ENRICH_MIN_MS = 120_000;
+const INBOX_POLL_PROFILE_ENRICH_MIN_MS = 30 * 60 * 1000;
 let pageTokenRefreshTimer = null;
+let graphFallbackTimer = null;
+let graphFallbackInFlight = null;
+let lastGraphFallbackRunAt = 0;
 function facebookAiReplyDeps() {
     return {
         getPageToken: getPageTokenForPage,
@@ -51,7 +59,9 @@ function scheduleBackgroundProfileEnrichment() {
         }
         finally {
             profileEnrichInFlight = false;
-            if (lastRemaining > 0) {
+            // Chỉ tự chạy tiếp khi lượt vừa rồi thật sự sửa được dữ liệu.
+            // Nếu Graph không trả profile, poll/webhook sau này sẽ kích hoạt lại theo nhịp chậm hơn.
+            if (lastRemaining > 0 && totalUpdated > 0) {
                 setTimeout(() => scheduleBackgroundProfileEnrichment(), 3000);
             }
         }
@@ -90,6 +100,10 @@ function parseAllowedFacebookMediaUrl(raw) {
 }
 /** Lấy ảnh/video/permalink bài QC qua Graph (URL webhook thường hết hạn). */
 export async function resolveAdCreativeMedia(pageId, postId) {
+    const cacheKey = `${pageId}:${postId}`;
+    const cached = adCreativeMediaCache.get(cacheKey);
+    if (cached && cached.expireAt > Date.now())
+        return cached.value;
     const token = await getPageTokenForPage(pageId);
     if (!token)
         return {};
@@ -98,7 +112,12 @@ export async function resolveAdCreativeMedia(pageId, postId) {
     url.searchParams.set('access_token', token);
     const res = await fetch(url).catch(() => null);
     if (!res?.ok) {
-        return { permalinkUrl: `https://www.facebook.com/${pageId}/posts/${postId}` };
+        const value = { permalinkUrl: `https://www.facebook.com/${pageId}/posts/${postId}` };
+        adCreativeMediaCache.set(cacheKey, {
+            value,
+            expireAt: Date.now() + AD_CREATIVE_MEDIA_FALLBACK_TTL_MS,
+        });
+        return value;
     }
     const body = (await res.json().catch(() => ({})));
     let imageUrl = body.full_picture?.trim();
@@ -113,11 +132,16 @@ export async function resolveAdCreativeMedia(pageId, postId) {
             imageUrl = img;
     }
     const permalinkUrl = body.permalink_url?.trim() || `https://www.facebook.com/${pageId}/posts/${postId}`;
-    return {
+    const value = {
         imageUrl: imageUrl || undefined,
         videoUrl: videoUrl || undefined,
         permalinkUrl,
     };
+    adCreativeMediaCache.set(cacheKey, {
+        value,
+        expireAt: Date.now() + AD_CREATIVE_MEDIA_CACHE_TTL_MS,
+    });
+    return value;
 }
 async function consumeWebStreamWithByteCap(body, maxBytes) {
     const reader = body.getReader();
@@ -247,7 +271,52 @@ function startFacebookPageTokenRefreshLoop() {
     }, ms);
     console.log(`[facebook] Tự làm mới page token mỗi ${hours}h (từ FACEBOOK_USER_ACCESS_TOKEN)`);
 }
-/** Khởi động: page token + webhook → debounce → AI (không quét Firestore định kỳ). */
+function resolveFacebookGraphFallbackIntervalMs() {
+    if (process.env.FACEBOOK_GRAPH_FALLBACK_ENABLED?.trim() === '0')
+        return 0;
+    const raw = Number(process.env.FACEBOOK_GRAPH_FALLBACK_INTERVAL_MS?.trim());
+    if (Number.isFinite(raw) && raw > 0)
+        return Math.max(15_000, Math.floor(raw));
+    return 45_000;
+}
+function resolveFacebookGraphFallbackLookbackMs() {
+    const raw = Number(process.env.FACEBOOK_GRAPH_FALLBACK_LOOKBACK_MS?.trim());
+    if (Number.isFinite(raw) && raw > 0)
+        return Math.max(60_000, Math.floor(raw));
+    return 10 * 60_000;
+}
+function resolveFacebookGraphFallbackConversationsPerPage() {
+    const raw = Number(process.env.FACEBOOK_GRAPH_FALLBACK_CONVERSATIONS_PER_PAGE?.trim());
+    if (Number.isFinite(raw) && raw > 0)
+        return Math.min(25, Math.floor(raw));
+    return 8;
+}
+function resolveFacebookGraphFallbackMessagesPerConversation() {
+    const raw = Number(process.env.FACEBOOK_GRAPH_FALLBACK_MESSAGES_PER_CONVERSATION?.trim());
+    if (Number.isFinite(raw) && raw > 0)
+        return Math.min(10, Math.floor(raw));
+    return 5;
+}
+function resolveFacebookGraphFallbackMaxEvents() {
+    const raw = Number(process.env.FACEBOOK_GRAPH_FALLBACK_MAX_EVENTS?.trim());
+    if (Number.isFinite(raw) && raw > 0)
+        return Math.min(500, Math.floor(raw));
+    return 120;
+}
+function startFacebookGraphFallbackLoop() {
+    const intervalMs = resolveFacebookGraphFallbackIntervalMs();
+    if (intervalMs <= 0) {
+        console.log('[facebook-fallback] Graph fallback poller đang tắt (FACEBOOK_GRAPH_FALLBACK_ENABLED=0).');
+        return;
+    }
+    if (graphFallbackTimer)
+        clearInterval(graphFallbackTimer);
+    graphFallbackTimer = setInterval(() => {
+        void runFacebookGraphFallbackIfDue('timer').catch((e) => console.warn('[facebook-fallback] periodic run failed:', e));
+    }, intervalMs);
+    console.log(`[facebook-fallback] Graph poll fallback mỗi ${Math.round(intervalMs / 1000)}s để bù webhook hụt.`);
+}
+/** Khởi động: page token + webhook + Graph fallback → debounce → AI. */
 export function startFacebookMessagingBootstrap() {
     void (async () => {
         try {
@@ -257,8 +326,10 @@ export function startFacebookMessagingBootstrap() {
             console.warn('[facebook] warmFacebookPageTokenCache failed:', e);
         }
         startFacebookPageTokenRefreshLoop();
+        startFacebookGraphFallbackLoop();
+        void runFacebookGraphFallbackIfDue('startup').catch((e) => console.warn('[facebook-fallback] startup run failed:', e));
         const debounceMs = resolveFacebookAiReplyDebounceMs();
-        console.log(`[facebook-ai] Webhook → debounce ${debounceMs}ms → trả lời (retry khi lỗi tạm).`);
+        console.log(`[facebook-ai] Webhook/Graph fallback → debounce ${debounceMs}ms → trả lời (retry khi lỗi tạm).`);
     })().catch((e) => console.warn('[facebook] bootstrap failed:', e));
 }
 /** Ghi data/facebook-webhook-last.json mỗi webhook.
@@ -381,6 +452,173 @@ async function getPageTokenForPage(pageId) {
     console.warn(`[facebook] Không có page token cho ${pageId}. Các page đã map: ${[...pageTokenCache.keys()].join(', ') || '(trống)'}`);
     return null;
 }
+function graphMessageToWebhookEvent(pageId, message) {
+    const mid = message.id?.trim();
+    const created = message.created_time ? new Date(message.created_time) : null;
+    const ts = created && Number.isFinite(created.getTime()) ? created.getTime() : Date.now();
+    const fromId = message.from?.id?.trim();
+    if (!mid || !fromId)
+        return null;
+    const toIds = (message.to?.data ?? [])
+        .map((item) => item.id?.trim())
+        .filter((id) => Boolean(id));
+    const text = message.message?.trim();
+    if (fromId === pageId) {
+        const customerPsid = toIds.find((id) => id !== pageId);
+        if (!customerPsid)
+            return null;
+        return {
+            sender: { id: pageId },
+            recipient: { id: customerPsid },
+            timestamp: ts,
+            message: {
+                mid,
+                ...(text ? { text } : {}),
+                is_echo: true,
+            },
+        };
+    }
+    return {
+        sender: { id: fromId },
+        recipient: { id: pageId },
+        timestamp: ts,
+        message: {
+            mid,
+            ...(text ? { text } : {}),
+        },
+    };
+}
+async function fetchRecentConversationMessagesFromGraph(input) {
+    const url = new URL('https://graph.facebook.com/v20.0/me/conversations');
+    url.searchParams.set('limit', String(input.conversationLimit));
+    url.searchParams.set('fields', `id,updated_time,messages.limit(${input.messageLimit}){id,message,created_time,from,to}`);
+    url.searchParams.set('access_token', input.token);
+    const res = await fetch(url, {
+        signal: AbortSignal.timeout(20_000),
+    }).catch(() => null);
+    if (!res?.ok) {
+        const errText = (await res?.text().catch(() => '')) ?? '';
+        throw new Error(`Graph conversations ${input.pageId} failed (${res?.status ?? 'network'}): ${errText.slice(0, 200)}`);
+    }
+    const body = (await res.json());
+    return Array.isArray(body.data) ? body.data : [];
+}
+async function runFacebookGraphFallbackNow(reason) {
+    const pages = await fetchFacebookPagesFromTokens();
+    const sinceMs = Date.now() - resolveFacebookGraphFallbackLookbackMs();
+    const conversationLimit = resolveFacebookGraphFallbackConversationsPerPage();
+    const messageLimit = resolveFacebookGraphFallbackMessagesPerConversation();
+    const maxEvents = resolveFacebookGraphFallbackMaxEvents();
+    const entries = [];
+    let errors = 0;
+    let eventsBuilt = 0;
+    for (const page of pages) {
+        const pageId = page.id?.trim();
+        if (!pageId || eventsBuilt >= maxEvents)
+            continue;
+        const token = pageTokenCache.get(pageId) ?? (await getPageTokenForPage(pageId));
+        if (!token)
+            continue;
+        let conversations = [];
+        try {
+            conversations = await fetchRecentConversationMessagesFromGraph({
+                pageId,
+                token,
+                conversationLimit,
+                messageLimit,
+            });
+        }
+        catch (e) {
+            errors += 1;
+            console.warn('[facebook-fallback] Graph fetch failed:', e instanceof Error ? e.message : e);
+            continue;
+        }
+        const messaging = [];
+        for (const conv of conversations) {
+            const updated = conv.updated_time ? new Date(conv.updated_time).getTime() : 0;
+            if (Number.isFinite(updated) && updated > 0 && updated < sinceMs)
+                continue;
+            for (const msg of conv.messages?.data ?? []) {
+                const created = msg.created_time ? new Date(msg.created_time).getTime() : 0;
+                if (!Number.isFinite(created) || created < sinceMs)
+                    continue;
+                const event = graphMessageToWebhookEvent(pageId, msg);
+                if (!event)
+                    continue;
+                messaging.push(event);
+                eventsBuilt += 1;
+                if (eventsBuilt >= maxEvents)
+                    break;
+            }
+            if (eventsBuilt >= maxEvents)
+                break;
+        }
+        if (messaging.length) {
+            entries.push({ id: pageId, time: Date.now(), messaging });
+        }
+    }
+    if (!entries.length) {
+        return {
+            ok: true,
+            pagesChecked: pages.length,
+            eventsBuilt,
+            messagesStored: 0,
+            pendingAiReplies: 0,
+            errors,
+        };
+    }
+    const stored = await ingestFacebookWebhookPayload({ object: 'page', entry: entries }, {
+        resolveCustomerProfile: fetchCustomerProfile,
+        fetchAttachmentMediaFromGraph: envFlag('FACEBOOK_DISABLE_GRAPH_ATTACHMENTS')
+            ? undefined
+            : fetchMessageAttachmentsFromGraph,
+        messengerCatalogGetToken: getPageTokenForPage,
+    });
+    if (stored.catalogDeferred.length) {
+        void (async () => {
+            for (const run of stored.catalogDeferred) {
+                await run().catch((e) => console.warn('[messenger-catalog]', e));
+            }
+        })();
+    }
+    if (stored.pendingAiReplies.length) {
+        scheduleFacebookAiReplies(stored.pendingAiReplies, facebookAiReplyDeps());
+    }
+    if (stored.messagesStored > 0) {
+        scheduleBackgroundProfileEnrichment();
+        console.log(`[facebook-fallback] ${reason}: stored=${stored.messagesStored}, pendingAi=${stored.pendingAiReplies.length}, pages=${pages.length}, events=${eventsBuilt}, errors=${errors}`);
+    }
+    return {
+        ok: true,
+        pagesChecked: pages.length,
+        eventsBuilt,
+        messagesStored: stored.messagesStored,
+        pendingAiReplies: stored.pendingAiReplies.length,
+        errors,
+    };
+}
+async function runFacebookGraphFallbackIfDue(reason) {
+    const intervalMs = resolveFacebookGraphFallbackIntervalMs();
+    if (intervalMs <= 0) {
+        return { ok: true, pagesChecked: 0, eventsBuilt: 0, messagesStored: 0, pendingAiReplies: 0, errors: 0 };
+    }
+    const minGapMs = Math.max(10_000, Math.floor(intervalMs * 0.75));
+    if (Date.now() - lastGraphFallbackRunAt < minGapMs) {
+        return { ok: true, pagesChecked: 0, eventsBuilt: 0, messagesStored: 0, pendingAiReplies: 0, errors: 0 };
+    }
+    if (graphFallbackInFlight)
+        return graphFallbackInFlight;
+    lastGraphFallbackRunAt = Date.now();
+    graphFallbackInFlight = runFacebookGraphFallbackNow(reason)
+        .catch((e) => {
+        console.warn('[facebook-fallback] run failed:', e);
+        return { ok: false, pagesChecked: 0, eventsBuilt: 0, messagesStored: 0, pendingAiReplies: 0, errors: 1 };
+    })
+        .finally(() => {
+        graphFallbackInFlight = null;
+    });
+    return graphFallbackInFlight;
+}
 function partitionAttachmentUrls(rows) {
     const images = [];
     const videos = [];
@@ -453,9 +691,14 @@ async function fetchCustomerProfile(pageId, customerPsid) {
     const cached = customerProfileCache.get(cacheKey);
     if (cached)
         return cached;
-    const token = await getPageTokenForPage(pageId);
-    if (!token)
+    const retryAt = customerProfileNegativeCache.get(cacheKey);
+    if (retryAt && retryAt > Date.now())
         return null;
+    const token = await getPageTokenForPage(pageId);
+    if (!token) {
+        customerProfileNegativeCache.set(cacheKey, Date.now() + CUSTOMER_PROFILE_NEGATIVE_CACHE_TTL_MS);
+        return null;
+    }
     const url = new URL(`https://graph.facebook.com/v20.0/${customerPsid}`);
     url.searchParams.set('fields', 'first_name,last_name,name,profile_pic,picture.type(large)');
     url.searchParams.set('access_token', token);
@@ -465,6 +708,7 @@ async function fetchCustomerProfile(pageId, customerPsid) {
             const errText = (await res?.text().catch(() => '')) ?? '';
             console.warn(`[facebook] profile ${customerPsid} page ${pageId} → ${res?.status} ${errText.slice(0, 300)}`);
         }
+        customerProfileNegativeCache.set(cacheKey, Date.now() + CUSTOMER_PROFILE_NEGATIVE_CACHE_TTL_MS);
         return null;
     }
     const profile = (await res.json());
@@ -473,8 +717,13 @@ async function fetchCustomerProfile(pageId, customerPsid) {
         undefined;
     const avatarUrl = profile.profile_pic?.trim() || profile.picture?.data?.url?.trim() || undefined;
     const normalized = { name, avatarUrl };
-    if (name || avatarUrl)
+    if (name || avatarUrl) {
         customerProfileCache.set(cacheKey, normalized);
+        customerProfileNegativeCache.delete(cacheKey);
+    }
+    else {
+        customerProfileNegativeCache.set(cacheKey, Date.now() + CUSTOMER_PROFILE_NEGATIVE_CACHE_TTL_MS);
+    }
     return normalized;
 }
 /** Chẩn đoán vì sao không có tên/avatar khách (dùng token CONTEXT_EDITOR_TOKEN). */
@@ -837,6 +1086,7 @@ export async function handleFacebookApi(req, res, url) {
     if ((req.method === 'GET' || req.method === 'POST') &&
         (url.pathname === '/api/facebook/conversations' ||
             url.pathname === '/api/facebook/conversations/poll')) {
+        void runFacebookGraphFallbackIfDue('inbox-poll').catch((e) => console.warn('[facebook-fallback] inbox-triggered run failed:', e));
         const now = Date.now();
         if (now - lastInboxPollProfileEnrichAt >= INBOX_POLL_PROFILE_ENRICH_MIN_MS) {
             lastInboxPollProfileEnrichAt = now;
@@ -863,6 +1113,15 @@ export async function handleFacebookApi(req, res, url) {
             focusConversationId,
             clientClocks,
         }));
+        return true;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/facebook/graph-fallback/run') {
+        if (!verifyContextEditToken(req)) {
+            json(res, 401, { ok: false, error: 'Thiếu hoặc sai X-Context-Edit-Token / Authorization Bearer.' });
+            return true;
+        }
+        const result = await runFacebookGraphFallbackNow('manual');
+        json(res, result.ok ? 200 : 500, result);
         return true;
     }
     if (req.method === 'GET' && url.pathname === '/api/facebook/cdn-media') {
@@ -1010,7 +1269,7 @@ export async function handleFacebookApi(req, res, url) {
         if (stored.pendingAiReplies.length) {
             scheduleFacebookAiReplies(stored.pendingAiReplies, facebookAiReplyDeps());
         }
-        if (stored.conversationsTouched > 0) {
+        if (stored.messagesStored > 0) {
             scheduleBackgroundProfileEnrichment();
         }
         return true;

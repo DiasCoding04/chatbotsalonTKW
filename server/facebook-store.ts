@@ -1093,9 +1093,17 @@ function upsertConversation(
   }
   if (customerProfile?.name) conversation.customerName = customerProfile.name
   if (customerProfile?.avatarUrl) conversation.avatarUrl = customerProfile.avatarUrl
-  conversation.updatedAt = timestamp
-  conversation.lastMessageAt = timestamp
+  if (!conversation.updatedAt || timestamp > conversation.updatedAt) conversation.updatedAt = timestamp
+  if (!conversation.lastMessageAt || timestamp > conversation.lastMessageAt) conversation.lastMessageAt = timestamp
   return conversation
+}
+
+function sortConversationMessagesByTime(conversation: FacebookStoredConversation): void {
+  conversation.messages.sort((a, b) => {
+    const byTime = a.timestamp.localeCompare(b.timestamp)
+    if (byTime !== 0) return byTime
+    return a.id.localeCompare(b.id)
+  })
 }
 
 /** Bỏ `raw` (payload webhook QC) khỏi JSON inbox — làm nhẹ egress; chi tiết đầy đủ chỉ trong Firestore. */
@@ -1256,7 +1264,7 @@ export async function readFacebookStoreForConversation(
 
 const BRANCH_IDS = new Set(BRANCH_PAGES.map((b) => b.id))
 
-const AI_REPLY_CLAIM_TTL_MS = 3 * 60 * 1000
+const AI_REPLY_CLAIM_TTL_MS = 60 * 1000
 const fileStoreClaimChains = new Map<string, Promise<boolean>>()
 
 function firestoreConversationDocUrl(conversationId: string): string {
@@ -1435,18 +1443,18 @@ async function persistConversationClaim(
 async function fileTryClaimFacebookAiReply(
   conversationId: string,
   customerMessageId: string,
-): Promise<boolean> {
+): Promise<{ ok: boolean; reason?: string }> {
   const prev = fileStoreClaimChains.get(conversationId) ?? Promise.resolve(true)
   const work = prev.then(async () => {
     const store = await readStore()
     let conv = store.conversations.find((c) => c.id === conversationId)
-    if (!conv) return false
+    if (!conv) return { ok: false, reason: 'missing_conversation' }
     syncAiRepliedMarkerFromMessages(conv)
     const gate = canClaimAiReplyForCustomer(conv, customerMessageId)
-    if (!gate.ok) return false
+    if (!gate.ok) return gate
     applyAiReplyClaim(conv, customerMessageId)
-    await persistConversationClaim(conv)
-    return true
+    const persisted = await persistConversationClaim(conv)
+    return persisted ? { ok: true } : { ok: false, reason: 'write_conflict' }
   })
   fileStoreClaimChains.set(
     conversationId,
@@ -1455,32 +1463,33 @@ async function fileTryClaimFacebookAiReply(
   return work
 }
 
-/** Chỉ một instance / lượt được xử lý tin khách này (sau debounce ~20s). */
+/** Chỉ một instance / lượt được xử lý tin khách này sau debounce. */
 export async function tryClaimFacebookAiReply(
   conversationId: string,
   customerMessageId: string,
-): Promise<boolean> {
+): Promise<{ ok: boolean; reason?: string }> {
   if (FACEBOOK_STORE_BACKEND === 'firestore' && FIRESTORE_PROJECT_ID) {
     const url = firestoreConversationDocUrl(conversationId)
     const res = await fetchFirestoreWithAuth(url)
     const raw = await res.text()
-    if (res.status === 404) return false
+    if (res.status === 404) return { ok: false, reason: 'missing_conversation' }
     if (!res.ok) throw new Error(raw || `Firestore get conversation failed (${res.status})`)
     const doc = JSON.parse(raw) as { fields?: FirestoreDocFields; updateTime?: string }
     const json = doc.fields?.json?.stringValue
-    if (!json) return false
+    if (!json) return { ok: false, reason: 'missing_json' }
     let conv: FacebookStoredConversation
     try {
       conv = JSON.parse(json) as FacebookStoredConversation
       repairConversationMessageAuthors(conv)
     } catch {
-      return false
+      return { ok: false, reason: 'invalid_json' }
     }
     syncAiRepliedMarkerFromMessages(conv)
     const gate = canClaimAiReplyForCustomer(conv, customerMessageId)
-    if (!gate.ok) return false
+    if (!gate.ok) return gate
     applyAiReplyClaim(conv, customerMessageId)
-    return persistConversationClaim(conv)
+    const persisted = await persistConversationClaim(conv)
+    return persisted ? { ok: true } : { ok: false, reason: 'write_conflict' }
   }
   return fileTryClaimFacebookAiReply(conversationId, customerMessageId)
 }
@@ -1825,8 +1834,8 @@ export async function ingestFacebookWebhookPayload(
     }
     if (profile?.name) conversation.customerName = profile.name
     if (profile?.avatarUrl) conversation.avatarUrl = profile.avatarUrl
-    conversation.updatedAt = timestamp
-    conversation.lastMessageAt = timestamp
+    if (!conversation.updatedAt || timestamp > conversation.updatedAt) conversation.updatedAt = timestamp
+    if (!conversation.lastMessageAt || timestamp > conversation.lastMessageAt) conversation.lastMessageAt = timestamp
     return conversation
   }
 
@@ -1854,13 +1863,34 @@ export async function ingestFacebookWebhookPayload(
 
       if (event.read || event.delivery) {
         const customerPsid = senderId === pageId ? recipientId : senderId
-        const profile = await options?.resolveCustomerProfile?.(pageId, customerPsid).catch(() => null)
-        const conversation = await touchConversation(pageId, customerPsid, timestamp, profile)
-        if (event.read?.watermark) conversation.customerReadAt = isoFromMetaTimestamp(event.read.watermark)
-        if (event.delivery?.watermark) conversation.pageDeliveredAt = isoFromMetaTimestamp(event.delivery.watermark)
-        conversationsTouched += 1
-        dirtyConvIds.add(conversation.id)
-        storeMutated = true
+        const id = `${pageId}:${customerPsid}`
+        const conversation = fileStore
+          ? fileStore.conversations.find((item) => item.id === id)
+          : convAccum.get(id) ?? (await readConversationFromFirestore(id)) ?? undefined
+        if (!conversation) continue
+        if (!fileStore) convAccum.set(id, conversation)
+
+        let changed = false
+        if (event.read?.watermark) {
+          const next = isoFromMetaTimestamp(event.read.watermark)
+          if (!conversation.customerReadAt || next > conversation.customerReadAt) {
+            conversation.customerReadAt = next
+            changed = true
+          }
+        }
+        if (event.delivery?.watermark) {
+          const next = isoFromMetaTimestamp(event.delivery.watermark)
+          if (!conversation.pageDeliveredAt || next > conversation.pageDeliveredAt) {
+            conversation.pageDeliveredAt = next
+            changed = true
+          }
+        }
+        if (changed) {
+          conversation.updatedAt = timestamp
+          conversationsTouched += 1
+          dirtyConvIds.add(conversation.id)
+          storeMutated = true
+        }
         continue
       }
 
@@ -2004,6 +2034,10 @@ export async function ingestFacebookWebhookPayload(
   if (storeMutated) {
     const updatedAt = new Date().toISOString()
     if (fileStore) {
+      for (const id of dirtyConvIds) {
+        const conversation = fileStore.conversations.find((c) => c.id === id)
+        if (conversation) sortConversationMessagesByTime(conversation)
+      }
       fileStore.pages = pages
       fileStore.updatedAt = updatedAt
       await writeStore(fileStore, { dirtyConversationIds: dirtyConvIds })
@@ -2011,6 +2045,7 @@ export async function ingestFacebookWebhookPayload(
       const dirtyConversations = [...dirtyConvIds]
         .map((id) => convAccum.get(id))
         .filter((c): c is FacebookStoredConversation => Boolean(c))
+      for (const conversation of dirtyConversations) sortConversationMessagesByTime(conversation)
       await writeStore(
         { pages, conversations: dirtyConversations, updatedAt },
         {

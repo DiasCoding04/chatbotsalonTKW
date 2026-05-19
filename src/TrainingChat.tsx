@@ -17,6 +17,7 @@ import {
 } from './lib/image-attachments'
 import {
   buildContextCacheFingerprint,
+  getContextCacheScope,
   isSharedContextCacheValid,
   readSharedContextCacheRecord,
   resolveSharedContextCache,
@@ -54,8 +55,9 @@ type Msg = ChatTurn & {
 }
 
 const CUSTOMER_QUIET_MS = 15_000
-const RETRY_BASE_MS = 1_500
-const RETRY_MAX_MS = 15_000
+const RETRY_BASE_MS = 800
+const RETRY_MAX_MS = 5_000
+const STREAM_ATTEMPT_TIMEOUT_MS = 45_000
 
 function newClientId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -482,7 +484,7 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
   }, [isGemini, apiKey, geminiReady, serverGeminiReady, model, cacheSystemPrompt])
 
   useEffect(() => {
-    if (!isGemini || !contextCacheFingerprint) return
+    if (!isGemini || !contextCacheFingerprint || getContextCacheScope() !== 'browser') return
     const syncFromStorage = () => {
       const record = readSharedContextCacheRecord()
       if (!record || !isSharedContextCacheValid(record, contextCacheFingerprint)) return
@@ -659,33 +661,34 @@ export function TrainingChat({ forcedProvider, forcedModel, title }: AppProps = 
 
     try {
       let retryCount = 0
-      const maxRetries = 12
+      const maxRetries = 4
       for (; retryCount < maxRetries; retryCount++) {
         try {
           streamingRef.current?.reset()
           const cachedContent = await resolveCachedContentForSend()
           const tSend = performance.now()
-          const result = isGemini
-            ? await streamGeminiReply(
-                apiKey,
-                model,
-                systemPrompt,
-                historyForApi,
-                (delta) => {
-                  streamingRef.current?.append(delta)
-                },
-                { maxOutputTokens, cachedContent },
-              )
-            : await streamOpenaiReply(
-                apiKey,
-                model,
-                systemPrompt,
-                historyForApi,
-                (delta) => {
-                  streamingRef.current?.append(delta)
-                },
-                { maxOutputTokens },
-              )
+          const attemptAbort = new AbortController()
+          const timeout = window.setTimeout(() => attemptAbort.abort(), STREAM_ATTEMPT_TIMEOUT_MS)
+          const result = await (async () => {
+            try {
+              return isGemini
+                ? await streamGeminiReply(apiKey, model, systemPrompt, historyForApi, (delta) => {
+                    streamingRef.current?.append(delta)
+                  }, {
+                    maxOutputTokens,
+                    cachedContent,
+                    signal: attemptAbort.signal,
+                  })
+                : await streamOpenaiReply(apiKey, model, systemPrompt, historyForApi, (delta) => {
+                    streamingRef.current?.append(delta)
+                  }, {
+                    maxOutputTokens,
+                    signal: attemptAbort.signal,
+                  })
+            } finally {
+              window.clearTimeout(timeout)
+            }
+          })()
 
           const tAfter = performance.now()
           setLastPerf({

@@ -4,7 +4,45 @@ const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const SCOPE = 'https://www.googleapis.com/auth/cloud-platform';
 const METADATA_TOKEN_URL = 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token';
 const EARLY_REFRESH_MS = 60_000;
+const DEFAULT_VERTEX_ACCESS_TOKEN_FETCH_MS = 15_000;
+const SLOW_VERTEX_ACCESS_TOKEN_FETCH_MS = 2_000;
 let cachedToken = null;
+function resolveVertexAccessTokenFetchMs() {
+    const raw = process.env.VERTEX_ACCESS_TOKEN_FETCH_MS?.trim();
+    if (raw === '0')
+        return 0;
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0)
+        return n;
+    return DEFAULT_VERTEX_ACCESS_TOKEN_FETCH_MS;
+}
+function withTimeoutSignal(timeoutMs, upstreamSignal) {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+        return upstreamSignal ?? undefined;
+    }
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    return upstreamSignal ? AbortSignal.any([upstreamSignal, timeoutSignal]) : timeoutSignal;
+}
+async function fetchWithTimeout(url, init, timeoutMs, label) {
+    const startedAt = Date.now();
+    try {
+        const res = await fetch(url, {
+            ...init,
+            signal: withTimeoutSignal(timeoutMs, init.signal),
+        });
+        const elapsedMs = Date.now() - startedAt;
+        if (elapsedMs >= SLOW_VERTEX_ACCESS_TOKEN_FETCH_MS) {
+            console.warn(`[vertex-auth] ${label} slow elapsedMs=${elapsedMs}`);
+        }
+        return res;
+    }
+    catch (error) {
+        if (error instanceof Error && error.name === 'AbortError') {
+            throw new Error(`${label} timed out after ${timeoutMs}ms`);
+        }
+        throw error;
+    }
+}
 export function clearVertexAccessTokenCache() {
     cachedToken = null;
 }
@@ -42,10 +80,11 @@ function createJwt(sa) {
     return `${unsigned}.${signature.replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '')}`;
 }
 async function getMetadataAccessToken() {
-    const res = await fetch(METADATA_TOKEN_URL, {
+    const timeoutMs = resolveVertexAccessTokenFetchMs();
+    const res = await fetchWithTimeout(METADATA_TOKEN_URL, {
         method: 'GET',
         headers: { 'Metadata-Flavor': 'Google' },
-    });
+    }, timeoutMs, 'metadata_token_fetch');
     const raw = await res.text();
     if (!res.ok)
         throw new Error(raw || `${res.status} ${res.statusText}`);
@@ -67,14 +106,15 @@ export async function getVertexAccessToken() {
     let expiresIn = 3600;
     if (serviceAccount) {
         const assertion = createJwt(serviceAccount);
-        const res = await fetch(TOKEN_URL, {
+        const timeoutMs = resolveVertexAccessTokenFetchMs();
+        const res = await fetchWithTimeout(TOKEN_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: new URLSearchParams({
                 grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
                 assertion,
             }),
-        });
+        }, timeoutMs, 'oauth_token_fetch');
         const raw = await res.text();
         if (!res.ok)
             throw new Error(raw || `${res.status} ${res.statusText}`);

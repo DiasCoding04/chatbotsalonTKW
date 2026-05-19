@@ -1,15 +1,17 @@
-param(
+﻿param(
   [string]$Project = 'gen-lang-client-0335766885',
   [string]$Region = 'asia-southeast1',
   [string]$Service = 'chatbot-tkw',
   [string]$EnvFile = "$PSScriptRoot\env\server.env",
   [string]$SecretName = 'vertex-service-account-json',
   [string]$LiveServiceUrl = 'https://chatbot-tkw-482155434300.asia-southeast1.run.app',
-  # Vertex + CONTEXT lớn: 512Mi dễ OOM/502 — mặc định nâng RAM (chỉnh -Memory hoặc gcloud patch).
+  # Vertex + CONTEXT lá»›n: 512Mi dá»… OOM/502 â€” máº·c Ä‘á»‹nh nÃ¢ng RAM (chá»‰nh -Memory hoáº·c gcloud patch).
   [string]$Memory = '2Gi',
   [string]$Cpu = '1',
   [switch]$SkipContextSync,
-  # Mặc định xóa toàn bộ Vertex cache sau deploy (tránh cache cũ + fingerprint lệch).
+  # Máº·c Ä‘á»‹nh KHÃ”NG purge toÃ n bá»™ cache sau deploy. Chá»‰ báº­t khi tháº­t sá»± muá»‘n xoÃ¡ cÆ°á»¡ng bá»©c.
+  [switch]$PurgeContextCache,
+  # Giá»¯ láº¡i Ä‘á»ƒ tÆ°Æ¡ng thÃ­ch vá»›i lá»‡nh cÅ©; hiá»‡n táº¡i máº·c Ä‘á»‹nh Ä‘Ã£ lÃ  skip purge.
   [switch]$SkipPurgeContextCache
 )
 
@@ -154,7 +156,12 @@ Write-Host "& $gcloudCmd $($deployArgs -join ' ')"
 $exitCode = $LASTEXITCODE
 Remove-Item $runtimeEnvPath -ErrorAction SilentlyContinue
 
-if ($exitCode -eq 0 -and -not $SkipPurgeContextCache) {
+if ($PurgeContextCache -and $SkipPurgeContextCache) {
+  Write-Error '[context-cache] Do not use -PurgeContextCache and -SkipPurgeContextCache together.'
+  exit 2
+}
+
+if ($exitCode -eq 0 -and $PurgeContextCache) {
   $editorToken = $envData['CONTEXT_EDITOR_TOKEN']
   if ($editorToken) {
     Write-Host "[context-cache] Post-deploy: purge all remote cachedContents at $LiveServiceUrl ..."
@@ -170,10 +177,10 @@ if ($exitCode -eq 0 -and -not $SkipPurgeContextCache) {
     Write-Warning '[context-cache] CONTEXT_EDITOR_TOKEN missing in env file - skip post-deploy purge.'
   }
 } elseif ($exitCode -eq 0) {
-  Write-Host '[context-cache] Post-deploy purge skipped (-SkipPurgeContextCache).'
+  Write-Host '[context-cache] Post-deploy purge skipped by default. Use -PurgeContextCache only when a forced purge is needed.'
 }
 
-Write-Host '[ops] Builds: nếu gcloud builds list rỗng — kiểm tra IAM roles (Cloud Build Viewer) hoặc dùng GCP Console khác source-based deploy.'
-Write-Host "[ops] Đặt RAM mà không build lại: deploy\patch-cloud-run-memory.ps1 - hoặc: gcloud run services update $Service --region=$Region --project=$Project --memory=$Memory"
+Write-Host '[ops] If gcloud builds list is empty, check IAM roles (Cloud Build Viewer) or use the GCP Console.'
+Write-Host "[ops] Change RAM without rebuilding: deploy\patch-cloud-run-memory.ps1 or gcloud run services update $Service --region=$Region --project=$Project --memory=$Memory"
 
 exit $exitCode

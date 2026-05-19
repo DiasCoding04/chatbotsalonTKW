@@ -844,9 +844,19 @@ function upsertConversation(store, pageId, customerPsid, timestamp, customerProf
         conversation.customerName = customerProfile.name;
     if (customerProfile?.avatarUrl)
         conversation.avatarUrl = customerProfile.avatarUrl;
-    conversation.updatedAt = timestamp;
-    conversation.lastMessageAt = timestamp;
+    if (!conversation.updatedAt || timestamp > conversation.updatedAt)
+        conversation.updatedAt = timestamp;
+    if (!conversation.lastMessageAt || timestamp > conversation.lastMessageAt)
+        conversation.lastMessageAt = timestamp;
     return conversation;
+}
+function sortConversationMessagesByTime(conversation) {
+    conversation.messages.sort((a, b) => {
+        const byTime = a.timestamp.localeCompare(b.timestamp);
+        if (byTime !== 0)
+            return byTime;
+        return a.id.localeCompare(b.id);
+    });
 }
 /** Bỏ `raw` (payload webhook QC) khỏi JSON inbox — làm nhẹ egress; chi tiết đầy đủ chỉ trong Firestore. */
 function stripAdAttributionForWire(att) {
@@ -989,7 +999,7 @@ export async function readFacebookStoreForConversation(conversationId, pageId) {
     return { conv, page };
 }
 const BRANCH_IDS = new Set(BRANCH_PAGES.map((b) => b.id));
-const AI_REPLY_CLAIM_TTL_MS = 3 * 60 * 1000;
+const AI_REPLY_CLAIM_TTL_MS = 60 * 1000;
 const fileStoreClaimChains = new Map();
 function firestoreConversationDocUrl(conversationId) {
     return `${firestoreConversationsCollectionUrl()}/${encodeURIComponent(conversationId)}`;
@@ -1155,46 +1165,47 @@ async function fileTryClaimFacebookAiReply(conversationId, customerMessageId) {
         const store = await readStore();
         let conv = store.conversations.find((c) => c.id === conversationId);
         if (!conv)
-            return false;
+            return { ok: false, reason: 'missing_conversation' };
         syncAiRepliedMarkerFromMessages(conv);
         const gate = canClaimAiReplyForCustomer(conv, customerMessageId);
         if (!gate.ok)
-            return false;
+            return gate;
         applyAiReplyClaim(conv, customerMessageId);
-        await persistConversationClaim(conv);
-        return true;
+        const persisted = await persistConversationClaim(conv);
+        return persisted ? { ok: true } : { ok: false, reason: 'write_conflict' };
     });
     fileStoreClaimChains.set(conversationId, work.then(() => true).catch(() => true));
     return work;
 }
-/** Chỉ một instance / lượt được xử lý tin khách này (sau debounce ~20s). */
+/** Chỉ một instance / lượt được xử lý tin khách này sau debounce. */
 export async function tryClaimFacebookAiReply(conversationId, customerMessageId) {
     if (FACEBOOK_STORE_BACKEND === 'firestore' && FIRESTORE_PROJECT_ID) {
         const url = firestoreConversationDocUrl(conversationId);
         const res = await fetchFirestoreWithAuth(url);
         const raw = await res.text();
         if (res.status === 404)
-            return false;
+            return { ok: false, reason: 'missing_conversation' };
         if (!res.ok)
             throw new Error(raw || `Firestore get conversation failed (${res.status})`);
         const doc = JSON.parse(raw);
         const json = doc.fields?.json?.stringValue;
         if (!json)
-            return false;
+            return { ok: false, reason: 'missing_json' };
         let conv;
         try {
             conv = JSON.parse(json);
             repairConversationMessageAuthors(conv);
         }
         catch {
-            return false;
+            return { ok: false, reason: 'invalid_json' };
         }
         syncAiRepliedMarkerFromMessages(conv);
         const gate = canClaimAiReplyForCustomer(conv, customerMessageId);
         if (!gate.ok)
-            return false;
+            return gate;
         applyAiReplyClaim(conv, customerMessageId);
-        return persistConversationClaim(conv);
+        const persisted = await persistConversationClaim(conv);
+        return persisted ? { ok: true } : { ok: false, reason: 'write_conflict' };
     }
     return fileTryClaimFacebookAiReply(conversationId, customerMessageId);
 }
@@ -1480,8 +1491,10 @@ export async function ingestFacebookWebhookPayload(payload, options) {
             conversation.customerName = profile.name;
         if (profile?.avatarUrl)
             conversation.avatarUrl = profile.avatarUrl;
-        conversation.updatedAt = timestamp;
-        conversation.lastMessageAt = timestamp;
+        if (!conversation.updatedAt || timestamp > conversation.updatedAt)
+            conversation.updatedAt = timestamp;
+        if (!conversation.lastMessageAt || timestamp > conversation.lastMessageAt)
+            conversation.lastMessageAt = timestamp;
         return conversation;
     };
     let conversationsTouched = 0;
@@ -1508,15 +1521,35 @@ export async function ingestFacebookWebhookPayload(payload, options) {
                 continue;
             if (event.read || event.delivery) {
                 const customerPsid = senderId === pageId ? recipientId : senderId;
-                const profile = await options?.resolveCustomerProfile?.(pageId, customerPsid).catch(() => null);
-                const conversation = await touchConversation(pageId, customerPsid, timestamp, profile);
-                if (event.read?.watermark)
-                    conversation.customerReadAt = isoFromMetaTimestamp(event.read.watermark);
-                if (event.delivery?.watermark)
-                    conversation.pageDeliveredAt = isoFromMetaTimestamp(event.delivery.watermark);
-                conversationsTouched += 1;
-                dirtyConvIds.add(conversation.id);
-                storeMutated = true;
+                const id = `${pageId}:${customerPsid}`;
+                const conversation = fileStore
+                    ? fileStore.conversations.find((item) => item.id === id)
+                    : convAccum.get(id) ?? (await readConversationFromFirestore(id)) ?? undefined;
+                if (!conversation)
+                    continue;
+                if (!fileStore)
+                    convAccum.set(id, conversation);
+                let changed = false;
+                if (event.read?.watermark) {
+                    const next = isoFromMetaTimestamp(event.read.watermark);
+                    if (!conversation.customerReadAt || next > conversation.customerReadAt) {
+                        conversation.customerReadAt = next;
+                        changed = true;
+                    }
+                }
+                if (event.delivery?.watermark) {
+                    const next = isoFromMetaTimestamp(event.delivery.watermark);
+                    if (!conversation.pageDeliveredAt || next > conversation.pageDeliveredAt) {
+                        conversation.pageDeliveredAt = next;
+                        changed = true;
+                    }
+                }
+                if (changed) {
+                    conversation.updatedAt = timestamp;
+                    conversationsTouched += 1;
+                    dirtyConvIds.add(conversation.id);
+                    storeMutated = true;
+                }
                 continue;
             }
             const message = event.message;
@@ -1652,6 +1685,11 @@ export async function ingestFacebookWebhookPayload(payload, options) {
     if (storeMutated) {
         const updatedAt = new Date().toISOString();
         if (fileStore) {
+            for (const id of dirtyConvIds) {
+                const conversation = fileStore.conversations.find((c) => c.id === id);
+                if (conversation)
+                    sortConversationMessagesByTime(conversation);
+            }
             fileStore.pages = pages;
             fileStore.updatedAt = updatedAt;
             await writeStore(fileStore, { dirtyConversationIds: dirtyConvIds });
@@ -1660,6 +1698,8 @@ export async function ingestFacebookWebhookPayload(payload, options) {
             const dirtyConversations = [...dirtyConvIds]
                 .map((id) => convAccum.get(id))
                 .filter((c) => Boolean(c));
+            for (const conversation of dirtyConversations)
+                sortConversationMessagesByTime(conversation);
             await writeStore({ pages, conversations: dirtyConversations, updatedAt }, {
                 dirtyConversationIds: dirtyConvIds,
                 writePagesRoot: pagesRootWrite,

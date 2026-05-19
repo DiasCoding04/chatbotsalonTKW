@@ -13,7 +13,7 @@ export type SharedContextCacheRecord = {
 
 export type ContextCacheScope = 'server' | 'browser'
 
-function getContextCacheScope(): ContextCacheScope {
+export function getContextCacheScope(): ContextCacheScope {
   const raw = (import.meta.env.VITE_CONTEXT_CACHE_SCOPE ?? 'server').toLowerCase().trim()
   return raw === 'browser' ? 'browser' : 'server'
 }

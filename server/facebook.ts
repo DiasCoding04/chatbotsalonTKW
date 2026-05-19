@@ -70,11 +70,44 @@ type FacebookGraphCustomerProfile = {
 
 const pageTokenCache = new Map<string, string>()
 const customerProfileCache = new Map<string, FacebookCustomerProfile>()
+const customerProfileNegativeCache = new Map<string, number>()
+const adCreativeMediaCache = new Map<string, { value: AdCreativeMediaResult; expireAt: number }>()
+const AD_CREATIVE_MEDIA_CACHE_TTL_MS = 6 * 60 * 60 * 1000
+const AD_CREATIVE_MEDIA_FALLBACK_TTL_MS = 15 * 60 * 1000
+const CUSTOMER_PROFILE_NEGATIVE_CACHE_TTL_MS = 6 * 60 * 60 * 1000
 let profileEnrichInFlight = false
-/** Tránh gọi enrich Graph mỗi lần poll inbox (4s) — gây lag server + UI. */
+/** Enrich profile là best-effort; chạy hiếm để tránh quét store + gọi Graph lặp vô ích. */
 let lastInboxPollProfileEnrichAt = 0
-const INBOX_POLL_PROFILE_ENRICH_MIN_MS = 120_000
+const INBOX_POLL_PROFILE_ENRICH_MIN_MS = 30 * 60 * 1000
 let pageTokenRefreshTimer: ReturnType<typeof setInterval> | null = null
+let graphFallbackTimer: ReturnType<typeof setInterval> | null = null
+let graphFallbackInFlight: Promise<FacebookGraphFallbackResult> | null = null
+let lastGraphFallbackRunAt = 0
+
+type FacebookGraphFallbackResult = {
+  ok: boolean
+  pagesChecked: number
+  eventsBuilt: number
+  messagesStored: number
+  pendingAiReplies: number
+  errors: number
+}
+
+type FacebookGraphConversationRow = {
+  id?: string
+  updated_time?: string
+  messages?: {
+    data?: FacebookGraphMessageRow[]
+  }
+}
+
+type FacebookGraphMessageRow = {
+  id?: string
+  message?: string
+  created_time?: string
+  from?: { id?: string; name?: string }
+  to?: { data?: Array<{ id?: string; name?: string }> }
+}
 
 function facebookAiReplyDeps(): FacebookAiDeps {
   return {
@@ -108,7 +141,9 @@ function scheduleBackgroundProfileEnrichment(): void {
       console.warn('[facebook] background profile enrich failed:', e)
     } finally {
       profileEnrichInFlight = false
-      if (lastRemaining > 0) {
+      // Chỉ tự chạy tiếp khi lượt vừa rồi thật sự sửa được dữ liệu.
+      // Nếu Graph không trả profile, poll/webhook sau này sẽ kích hoạt lại theo nhịp chậm hơn.
+      if (lastRemaining > 0 && totalUpdated > 0) {
         setTimeout(() => scheduleBackgroundProfileEnrichment(), 3000)
       }
     }
@@ -166,6 +201,10 @@ export async function resolveAdCreativeMedia(
   pageId: string,
   postId: string,
 ): Promise<AdCreativeMediaResult> {
+  const cacheKey = `${pageId}:${postId}`
+  const cached = adCreativeMediaCache.get(cacheKey)
+  if (cached && cached.expireAt > Date.now()) return cached.value
+
   const token = await getPageTokenForPage(pageId)
   if (!token) return {}
 
@@ -177,7 +216,12 @@ export async function resolveAdCreativeMedia(
   url.searchParams.set('access_token', token)
   const res = await fetch(url).catch(() => null)
   if (!res?.ok) {
-    return { permalinkUrl: `https://www.facebook.com/${pageId}/posts/${postId}` }
+    const value = { permalinkUrl: `https://www.facebook.com/${pageId}/posts/${postId}` }
+    adCreativeMediaCache.set(cacheKey, {
+      value,
+      expireAt: Date.now() + AD_CREATIVE_MEDIA_FALLBACK_TTL_MS,
+    })
+    return value
   }
 
   const body = (await res.json().catch(() => ({}))) as {
@@ -205,11 +249,16 @@ export async function resolveAdCreativeMedia(
   const permalinkUrl =
     body.permalink_url?.trim() || `https://www.facebook.com/${pageId}/posts/${postId}`
 
-  return {
+  const value = {
     imageUrl: imageUrl || undefined,
     videoUrl: videoUrl || undefined,
     permalinkUrl,
   }
+  adCreativeMediaCache.set(cacheKey, {
+    value,
+    expireAt: Date.now() + AD_CREATIVE_MEDIA_CACHE_TTL_MS,
+  })
+  return value
 }
 
 async function consumeWebStreamWithByteCap(
@@ -357,7 +406,53 @@ function startFacebookPageTokenRefreshLoop(): void {
   console.log(`[facebook] Tự làm mới page token mỗi ${hours}h (từ FACEBOOK_USER_ACCESS_TOKEN)`)
 }
 
-/** Khởi động: page token + webhook → debounce → AI (không quét Firestore định kỳ). */
+function resolveFacebookGraphFallbackIntervalMs(): number {
+  if (process.env.FACEBOOK_GRAPH_FALLBACK_ENABLED?.trim() === '0') return 0
+  const raw = Number(process.env.FACEBOOK_GRAPH_FALLBACK_INTERVAL_MS?.trim())
+  if (Number.isFinite(raw) && raw > 0) return Math.max(15_000, Math.floor(raw))
+  return 45_000
+}
+
+function resolveFacebookGraphFallbackLookbackMs(): number {
+  const raw = Number(process.env.FACEBOOK_GRAPH_FALLBACK_LOOKBACK_MS?.trim())
+  if (Number.isFinite(raw) && raw > 0) return Math.max(60_000, Math.floor(raw))
+  return 10 * 60_000
+}
+
+function resolveFacebookGraphFallbackConversationsPerPage(): number {
+  const raw = Number(process.env.FACEBOOK_GRAPH_FALLBACK_CONVERSATIONS_PER_PAGE?.trim())
+  if (Number.isFinite(raw) && raw > 0) return Math.min(25, Math.floor(raw))
+  return 8
+}
+
+function resolveFacebookGraphFallbackMessagesPerConversation(): number {
+  const raw = Number(process.env.FACEBOOK_GRAPH_FALLBACK_MESSAGES_PER_CONVERSATION?.trim())
+  if (Number.isFinite(raw) && raw > 0) return Math.min(10, Math.floor(raw))
+  return 5
+}
+
+function resolveFacebookGraphFallbackMaxEvents(): number {
+  const raw = Number(process.env.FACEBOOK_GRAPH_FALLBACK_MAX_EVENTS?.trim())
+  if (Number.isFinite(raw) && raw > 0) return Math.min(500, Math.floor(raw))
+  return 120
+}
+
+function startFacebookGraphFallbackLoop(): void {
+  const intervalMs = resolveFacebookGraphFallbackIntervalMs()
+  if (intervalMs <= 0) {
+    console.log('[facebook-fallback] Graph fallback poller đang tắt (FACEBOOK_GRAPH_FALLBACK_ENABLED=0).')
+    return
+  }
+  if (graphFallbackTimer) clearInterval(graphFallbackTimer)
+  graphFallbackTimer = setInterval(() => {
+    void runFacebookGraphFallbackIfDue('timer').catch((e) =>
+      console.warn('[facebook-fallback] periodic run failed:', e),
+    )
+  }, intervalMs)
+  console.log(`[facebook-fallback] Graph poll fallback mỗi ${Math.round(intervalMs / 1000)}s để bù webhook hụt.`)
+}
+
+/** Khởi động: page token + webhook + Graph fallback → debounce → AI. */
 export function startFacebookMessagingBootstrap(): void {
   void (async () => {
     try {
@@ -366,8 +461,12 @@ export function startFacebookMessagingBootstrap(): void {
       console.warn('[facebook] warmFacebookPageTokenCache failed:', e)
     }
     startFacebookPageTokenRefreshLoop()
+    startFacebookGraphFallbackLoop()
+    void runFacebookGraphFallbackIfDue('startup').catch((e) =>
+      console.warn('[facebook-fallback] startup run failed:', e),
+    )
     const debounceMs = resolveFacebookAiReplyDebounceMs()
-    console.log(`[facebook-ai] Webhook → debounce ${debounceMs}ms → trả lời (retry khi lỗi tạm).`)
+    console.log(`[facebook-ai] Webhook/Graph fallback → debounce ${debounceMs}ms → trả lời (retry khi lỗi tạm).`)
   })().catch((e) => console.warn('[facebook] bootstrap failed:', e))
 }
 
@@ -507,6 +606,199 @@ async function getPageTokenForPage(pageId: string): Promise<string | null> {
   return null
 }
 
+function graphMessageToWebhookEvent(
+  pageId: string,
+  message: FacebookGraphMessageRow,
+): {
+  sender: { id: string }
+  recipient: { id: string }
+  timestamp: number
+  message: { mid: string; text?: string; is_echo?: boolean }
+} | null {
+  const mid = message.id?.trim()
+  const created = message.created_time ? new Date(message.created_time) : null
+  const ts = created && Number.isFinite(created.getTime()) ? created.getTime() : Date.now()
+  const fromId = message.from?.id?.trim()
+  if (!mid || !fromId) return null
+
+  const toIds = (message.to?.data ?? [])
+    .map((item) => item.id?.trim())
+    .filter((id): id is string => Boolean(id))
+  const text = message.message?.trim()
+
+  if (fromId === pageId) {
+    const customerPsid = toIds.find((id) => id !== pageId)
+    if (!customerPsid) return null
+    return {
+      sender: { id: pageId },
+      recipient: { id: customerPsid },
+      timestamp: ts,
+      message: {
+        mid,
+        ...(text ? { text } : {}),
+        is_echo: true,
+      },
+    }
+  }
+
+  return {
+    sender: { id: fromId },
+    recipient: { id: pageId },
+    timestamp: ts,
+    message: {
+      mid,
+      ...(text ? { text } : {}),
+    },
+  }
+}
+
+async function fetchRecentConversationMessagesFromGraph(input: {
+  pageId: string
+  token: string
+  conversationLimit: number
+  messageLimit: number
+}): Promise<FacebookGraphConversationRow[]> {
+  const url = new URL('https://graph.facebook.com/v20.0/me/conversations')
+  url.searchParams.set('limit', String(input.conversationLimit))
+  url.searchParams.set(
+    'fields',
+    `id,updated_time,messages.limit(${input.messageLimit}){id,message,created_time,from,to}`,
+  )
+  url.searchParams.set('access_token', input.token)
+  const res = await fetch(url, {
+    signal: AbortSignal.timeout(20_000),
+  }).catch(() => null)
+  if (!res?.ok) {
+    const errText = (await res?.text().catch(() => '')) ?? ''
+    throw new Error(`Graph conversations ${input.pageId} failed (${res?.status ?? 'network'}): ${errText.slice(0, 200)}`)
+  }
+  const body = (await res.json()) as { data?: FacebookGraphConversationRow[] }
+  return Array.isArray(body.data) ? body.data : []
+}
+
+async function runFacebookGraphFallbackNow(reason: string): Promise<FacebookGraphFallbackResult> {
+  const pages = await fetchFacebookPagesFromTokens()
+  const sinceMs = Date.now() - resolveFacebookGraphFallbackLookbackMs()
+  const conversationLimit = resolveFacebookGraphFallbackConversationsPerPage()
+  const messageLimit = resolveFacebookGraphFallbackMessagesPerConversation()
+  const maxEvents = resolveFacebookGraphFallbackMaxEvents()
+  const entries: Array<{
+    id: string
+    time: number
+    messaging: ReturnType<typeof graphMessageToWebhookEvent>[]
+  }> = []
+  let errors = 0
+  let eventsBuilt = 0
+
+  for (const page of pages) {
+    const pageId = page.id?.trim()
+    if (!pageId || eventsBuilt >= maxEvents) continue
+    const token = pageTokenCache.get(pageId) ?? (await getPageTokenForPage(pageId))
+    if (!token) continue
+    let conversations: FacebookGraphConversationRow[] = []
+    try {
+      conversations = await fetchRecentConversationMessagesFromGraph({
+        pageId,
+        token,
+        conversationLimit,
+        messageLimit,
+      })
+    } catch (e) {
+      errors += 1
+      console.warn('[facebook-fallback] Graph fetch failed:', e instanceof Error ? e.message : e)
+      continue
+    }
+
+    const messaging: NonNullable<(typeof entries)[number]['messaging']> = []
+    for (const conv of conversations) {
+      const updated = conv.updated_time ? new Date(conv.updated_time).getTime() : 0
+      if (Number.isFinite(updated) && updated > 0 && updated < sinceMs) continue
+      for (const msg of conv.messages?.data ?? []) {
+        const created = msg.created_time ? new Date(msg.created_time).getTime() : 0
+        if (!Number.isFinite(created) || created < sinceMs) continue
+        const event = graphMessageToWebhookEvent(pageId, msg)
+        if (!event) continue
+        messaging.push(event)
+        eventsBuilt += 1
+        if (eventsBuilt >= maxEvents) break
+      }
+      if (eventsBuilt >= maxEvents) break
+    }
+    if (messaging.length) {
+      entries.push({ id: pageId, time: Date.now(), messaging })
+    }
+  }
+
+  if (!entries.length) {
+    return {
+      ok: true,
+      pagesChecked: pages.length,
+      eventsBuilt,
+      messagesStored: 0,
+      pendingAiReplies: 0,
+      errors,
+    }
+  }
+
+  const stored = await ingestFacebookWebhookPayload(
+    { object: 'page', entry: entries },
+    {
+      resolveCustomerProfile: fetchCustomerProfile,
+      fetchAttachmentMediaFromGraph: envFlag('FACEBOOK_DISABLE_GRAPH_ATTACHMENTS')
+        ? undefined
+        : fetchMessageAttachmentsFromGraph,
+      messengerCatalogGetToken: getPageTokenForPage,
+    },
+  )
+  if (stored.catalogDeferred.length) {
+    void (async () => {
+      for (const run of stored.catalogDeferred) {
+        await run().catch((e) => console.warn('[messenger-catalog]', e))
+      }
+    })()
+  }
+  if (stored.pendingAiReplies.length) {
+    scheduleFacebookAiReplies(stored.pendingAiReplies, facebookAiReplyDeps())
+  }
+  if (stored.messagesStored > 0) {
+    scheduleBackgroundProfileEnrichment()
+    console.log(
+      `[facebook-fallback] ${reason}: stored=${stored.messagesStored}, pendingAi=${stored.pendingAiReplies.length}, pages=${pages.length}, events=${eventsBuilt}, errors=${errors}`,
+    )
+  }
+
+  return {
+    ok: true,
+    pagesChecked: pages.length,
+    eventsBuilt,
+    messagesStored: stored.messagesStored,
+    pendingAiReplies: stored.pendingAiReplies.length,
+    errors,
+  }
+}
+
+async function runFacebookGraphFallbackIfDue(reason: string): Promise<FacebookGraphFallbackResult> {
+  const intervalMs = resolveFacebookGraphFallbackIntervalMs()
+  if (intervalMs <= 0) {
+    return { ok: true, pagesChecked: 0, eventsBuilt: 0, messagesStored: 0, pendingAiReplies: 0, errors: 0 }
+  }
+  const minGapMs = Math.max(10_000, Math.floor(intervalMs * 0.75))
+  if (Date.now() - lastGraphFallbackRunAt < minGapMs) {
+    return { ok: true, pagesChecked: 0, eventsBuilt: 0, messagesStored: 0, pendingAiReplies: 0, errors: 0 }
+  }
+  if (graphFallbackInFlight) return graphFallbackInFlight
+  lastGraphFallbackRunAt = Date.now()
+  graphFallbackInFlight = runFacebookGraphFallbackNow(reason)
+    .catch((e) => {
+      console.warn('[facebook-fallback] run failed:', e)
+      return { ok: false, pagesChecked: 0, eventsBuilt: 0, messagesStored: 0, pendingAiReplies: 0, errors: 1 }
+    })
+    .finally(() => {
+      graphFallbackInFlight = null
+    })
+  return graphFallbackInFlight
+}
+
 type GraphAttachmentRow = { file_url?: string; mime_type?: string }
 
 function partitionAttachmentUrls(rows: GraphAttachmentRow[] | undefined): {
@@ -593,9 +885,14 @@ async function fetchCustomerProfile(
   const cacheKey = `${pageId}:${customerPsid}`
   const cached = customerProfileCache.get(cacheKey)
   if (cached) return cached
+  const retryAt = customerProfileNegativeCache.get(cacheKey)
+  if (retryAt && retryAt > Date.now()) return null
 
   const token = await getPageTokenForPage(pageId)
-  if (!token) return null
+  if (!token) {
+    customerProfileNegativeCache.set(cacheKey, Date.now() + CUSTOMER_PROFILE_NEGATIVE_CACHE_TTL_MS)
+    return null
+  }
 
   const url = new URL(`https://graph.facebook.com/v20.0/${customerPsid}`)
   url.searchParams.set('fields', 'first_name,last_name,name,profile_pic,picture.type(large)')
@@ -606,6 +903,7 @@ async function fetchCustomerProfile(
       const errText = (await res?.text().catch(() => '')) ?? ''
       console.warn(`[facebook] profile ${customerPsid} page ${pageId} → ${res?.status} ${errText.slice(0, 300)}`)
     }
+    customerProfileNegativeCache.set(cacheKey, Date.now() + CUSTOMER_PROFILE_NEGATIVE_CACHE_TTL_MS)
     return null
   }
 
@@ -616,7 +914,12 @@ async function fetchCustomerProfile(
     undefined
   const avatarUrl = profile.profile_pic?.trim() || profile.picture?.data?.url?.trim() || undefined
   const normalized = { name, avatarUrl }
-  if (name || avatarUrl) customerProfileCache.set(cacheKey, normalized)
+  if (name || avatarUrl) {
+    customerProfileCache.set(cacheKey, normalized)
+    customerProfileNegativeCache.delete(cacheKey)
+  } else {
+    customerProfileNegativeCache.set(cacheKey, Date.now() + CUSTOMER_PROFILE_NEGATIVE_CACHE_TTL_MS)
+  }
   return normalized
 }
 
@@ -1053,6 +1356,9 @@ export async function handleFacebookApi(req: IncomingMessage, res: ServerRespons
     (url.pathname === '/api/facebook/conversations' ||
       url.pathname === '/api/facebook/conversations/poll')
   ) {
+    void runFacebookGraphFallbackIfDue('inbox-poll').catch((e) =>
+      console.warn('[facebook-fallback] inbox-triggered run failed:', e),
+    )
     const now = Date.now()
     if (now - lastInboxPollProfileEnrichAt >= INBOX_POLL_PROFILE_ENRICH_MIN_MS) {
       lastInboxPollProfileEnrichAt = now
@@ -1086,6 +1392,16 @@ export async function handleFacebookApi(req: IncomingMessage, res: ServerRespons
         clientClocks,
       }),
     )
+    return true
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/facebook/graph-fallback/run') {
+    if (!verifyContextEditToken(req)) {
+      json(res, 401, { ok: false, error: 'Thiếu hoặc sai X-Context-Edit-Token / Authorization Bearer.' })
+      return true
+    }
+    const result = await runFacebookGraphFallbackNow('manual')
+    json(res, result.ok ? 200 : 500, result)
     return true
   }
 
@@ -1243,7 +1559,7 @@ export async function handleFacebookApi(req: IncomingMessage, res: ServerRespons
     if (stored.pendingAiReplies.length) {
       scheduleFacebookAiReplies(stored.pendingAiReplies, facebookAiReplyDeps())
     }
-    if (stored.conversationsTouched > 0) {
+    if (stored.messagesStored > 0) {
       scheduleBackgroundProfileEnrichment()
     }
     return true
