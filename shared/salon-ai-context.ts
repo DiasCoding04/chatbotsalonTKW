@@ -731,12 +731,16 @@ export function filterPrematureScheduleAskLines(
 /**
  * Sau khi gỡ hỏi lịch sớm: chỉ thêm «tham khảo dịch vụ nào» khi không còn dòng nào.
  * Không dí câu đó vào tin địa chỉ / giải thích khuyến mãi / trả lời đã đủ ngữ cảnh.
+ * Nếu khách đã nêu dịch vụ rõ ràng, xóa câu hỏi dịch vụ do AI tự sinh ra.
  */
 export function ensureAskServiceLineWhenNeeded(
   lines: string[],
   customerHasNamedService: boolean,
 ): string[] {
-  if (customerHasNamedService) return lines
+  if (customerHasNamedService) {
+    // Khách đã nêu dịch vụ → xóa câu hỏi dịch vụ (do AI tự sinh ra)
+    return lines.filter((line) => !lineLooksLikeAskService(line))
+  }
   if (lines.some((line) => lineLooksLikeAskService(line))) return lines
   const trimmed = lines.map((l) => l.trim()).filter(Boolean)
   if (trimmed.length > 0) return trimmed
